@@ -1,0 +1,52 @@
+# =============================================================================
+# .github/workflows/scanner.yml
+# OKX_PAMP_bot — автозапуск кожні 15 хвилин через GitHub Actions
+# =============================================================================
+
+name: OKX PAMP Scanner
+
+on:
+  # ── Автоматичний запуск за розкладом (UTC час)
+  # GitHub може затримувати cron до ~5 хв при навантаженні — це нормально
+  schedule:
+    - cron: "0,15,30,45 * * * *"   # кожні 15 хвилин
+
+  # ── Ручний запуск через вкладку Actions на GitHub (для тестування)
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12            # аварійний таймаут на випадок зависання
+
+    steps:
+      # ── Крок 1: клонуємо репозиторій разом з state.json (якщо вже є)
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── Крок 2: встановлюємо Python 3.11
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Крок 3: встановлюємо залежності (лише requests — стандартна бібліотека)
+      - name: Install dependencies
+        run: pip install requests
+
+      # ── Крок 4: запускаємо сканер з секретами Telegram
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py
+
+      # ── Крок 5: зберігаємо оновлений state.json назад у репозиторій
+      # Це дозволяє середні об'єми зберігатися між запусками
+      - name: Save state to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json || true
+          git diff --staged --quiet || git commit -m "update state"
+          git push origin main || true

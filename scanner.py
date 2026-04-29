@@ -1,7 +1,18 @@
 # =============================================================================
 # scanner.py
-# OKX_PAMP_bot — сканер пампів на ф'ючерсному ринку OKX (SWAP)
-# Умови: ціна < 5 USDT | ріст min→max >= 50% за 6 год | аномальний об'єм >= 10х
+# OKX_PAMP_bot — сканер пампів на ф'ючерсному ринку OKX (USDT-SWAP)
+#
+# БЛОК 1 (памп з об'ємами):
+#   1. Поточна ціна < 5 USDT
+#   2. Ріст ціни min→max >= 50% за 6 годин (24 свічки × 15хв)
+#   3. Аномальний об'єм >= 10х від ковзного середнього
+#
+# БЛОК 2 (рух без перевірки об'ємів):
+#   1. Поточна ціна < 5 USDT
+#   2. Ріст min→max >= 50% АБО падіння max→min >= 50% за 6 годин
+#   3. Монети що вже є в блоці 1 — не дублюються
+#
+# Збереження: середній об'єм кожної пари зберігається у state.json між запусками
 # =============================================================================
 
 import requests
@@ -13,32 +24,38 @@ from datetime import datetime, timezone
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК НАЛАШТУВАНЬ
 # ─────────────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]   # токен Telegram-бота
-TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]     # ID чату для сповіщень
 
-OKX_BASE_URL      = "https://www.okx.com"              # базова адреса OKX API
-STATE_FILE        = "state.json"                        # файл збереження середніх об'ємів
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-CANDLE_BAR        = "15m"                              # таймфрейм свічок
-CANDLES_COUNT     = 24                                 # кількість свічок = 6 годин (24 × 15хв)
-MAX_PRICE_USDT    = 5.0                                # максимальна ціна монети в USDT
-GROWTH_THRESHOLD  = 50.0                               # мінімальний ріст ціни min→max у %
-VOLUME_SPIKE_X    = 10.0                               # кратність аномального об'єму (10х)
-VOLUME_TAIL_X     = 5.0                                # кратність "хвостових" свічок (5х)
-HALF_CANDLES      = CANDLES_COUNT // 2                 # половина від загальної кількості свічок
-REQUEST_DELAY     = 0.12                               # затримка між запитами (rate limit OKX)
+OKX_BASE_URL     = "https://www.okx.com"
+
+STATE_FILE       = "state.json"
+
+CANDLE_BAR       = "15m"
+CANDLES_COUNT    = 24                      # 24 свічки × 15хв = 6 годин
+MAX_PRICE_USDT   = 5.0                     # максимально допустима ціна монети
+GROWTH_THRESHOLD = 50.0                    # мінімальний ріст/падіння у відсотках
+VOLUME_SPIKE_X   = 10.0                    # кратність аномального об'єму
+VOLUME_TAIL_X    = 5.0                     # кратність хвостових свічок
+HALF_CANDLES     = CANDLES_COUNT // 2      # половина від кількості свічок = 12
+REQUEST_DELAY    = 0.12                    # затримка між запитами (rate limit OKX)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 1: ЗАВАНТАЖЕННЯ ТА ЗБЕРЕЖЕННЯ СТАНУ (збережені середні об'єми між запусками)
+# БЛОК 1: ЗБЕРЕЖЕННЯ ТА ЗАВАНТАЖЕННЯ СТАНУ МІЖ ЗАПУСКАМИ
+# state.json зберігає: { "DOGE-USDT-SWAP": 12345.6, ... }
+# де значення — останнє ковзне середнє об'єму пари
 # ─────────────────────────────────────────────────────────────────────────────
+
 def load_state():
     """Завантажує збережені середні об'єми з попереднього запуску"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"Помилка читання state.json: {e}")
             return {}
     return {}
 
@@ -47,63 +64,65 @@ def save_state(state):
     """Зберігає оновлені середні об'єми для наступного запуску"""
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+            json.dump(state, f, indent=2)
     except Exception as e:
         print(f"Помилка збереження state.json: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 2: ОТРИМАННЯ ВСІХ SWAP-ІНСТРУМЕНТІВ З OKX
-# Повертає список усіх активних безстрокових ф'ючерсних пар
+# БЛОК 2: ОТРИМАННЯ СПИСКУ ВСІХ АКТИВНИХ USDT-SWAP ІНСТРУМЕНТІВ
 # ─────────────────────────────────────────────────────────────────────────────
+
 def get_all_swap_instruments():
-    """Отримує список всіх активних USDT-SWAP інструментів з OKX"""
-    url = f"{OKX_BASE_URL}/api/v5/public/instruments"
+    """Повертає список instId всіх активних USDT-SWAP інструментів на OKX"""
+    url    = f"{OKX_BASE_URL}/api/v5/public/instruments"
     params = {"instType": "SWAP"}
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
         if data.get("code") != "0":
-            print(f"Помилка отримання інструментів: {data}")
+            print(f"Помилка API instruments: {data.get('msg')}")
             return []
-        instruments = []
+        result = []
         for item in data.get("data", []):
             inst_id = item.get("instId", "")
-            # Беремо лише пари з USDT як розрахункова валюта
             if inst_id.endswith("-USDT-SWAP"):
-                instruments.append(inst_id)
-        return instruments
+                result.append(inst_id)
+        return result
     except Exception as e:
-        print(f"Виняток get_instruments: {e}")
+        print(f"Виняток get_all_swap_instruments: {e}")
         return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 3: ОТРИМАННЯ ПОТОЧНОГО ТІКЕРА (для перевірки ціни < 5 USDT)
+# БЛОК 3: ОТРИМАННЯ ПОТОЧНОЇ ЦІНИ (для відсівки за ціною < 5 USDT)
 # ─────────────────────────────────────────────────────────────────────────────
+
 def get_ticker_price(inst_id):
-    """Повертає поточну ціну last для інструменту"""
-    url = f"{OKX_BASE_URL}/api/v5/market/ticker"
+    """Повертає поточну ціну last або None при помилці"""
+    url    = f"{OKX_BASE_URL}/api/v5/market/ticker"
     params = {"instId": inst_id}
     try:
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
         if data.get("code") != "0" or not data.get("data"):
             return None
-        return float(data["data"][0].get("last", 0) or 0)
+        val = data["data"][0].get("last", 0)
+        return float(val) if val else None
     except Exception:
         return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 4: ОТРИМАННЯ 15-ХВИЛИННИХ СВІЧОК ЗА 6 ГОДИН
-# OKX повертає свічки від НОВИХ до СТАРИХ: [0]=найновіша, [-1]=найстаріша
-# Ми розвертаємо масив: [0]=найстаріша → [23]=найновіша
+# OKX повертає від нових до старих — розвертаємо:
+# [0]=найстаріша, [23]=найновіша
 # Формат свічки: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
 # ─────────────────────────────────────────────────────────────────────────────
+
 def get_candles(inst_id):
-    """Отримує 24 свічки по 15 хв (6 годин) та повертає від найстарішої до найновішої"""
-    url = f"{OKX_BASE_URL}/api/v5/market/candles"
+    """Повертає 24 свічки 15м від найстарішої [0] до найновішої [23]"""
+    url    = f"{OKX_BASE_URL}/api/v5/market/candles"
     params = {
         "instId": inst_id,
         "bar":    CANDLE_BAR,
@@ -115,7 +134,6 @@ def get_candles(inst_id):
         if data.get("code") != "0" or not data.get("data"):
             return []
         candles = data["data"]
-        # Розвертаємо: тепер [0]=найстаріша, [-1]=найновіша
         candles.reverse()
         return candles
     except Exception as e:
@@ -126,101 +144,100 @@ def get_candles(inst_id):
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 5: АЛГОРИТМ КОВЗНОГО СЕРЕДНЬОГО ОБ'ЄМІВ З ВИКЛЮЧЕННЯМ АНОМАЛІЙ
 #
-# Логіка:
-# 1. Базове середнє = збережене з попереднього запуску АБО об'єм свічки [0]
-# 2. Рухаємось від [0] до [23]:
-#    - якщо об'єм < середнє × 10 → включаємо в базу, перераховуємо середнє
-#    - якщо об'єм >= середнє × 10 → СИГНАЛ (аномалія знайдена)
-# 3. Після сигнальної свічки аналізуємо "хвіст":
-#    - якщо наступна свічка >= середнє × 5 → хвостова, рахуємо, не включаємо в базу
-#      (поки таких < половини від загального числа свічок)
-#    - якщо хвостових >= половини → включаємо їх у базу і шукаємо нову аномалію
-#    - якщо наступна свічка < середнє × 5 → нормальна, включаємо в базу
+# Стартове середнє = збережене з попереднього запуску АБО об'єм свічки [0]
+# Рух від [0] до [23]:
+#   obj < avg × 10  → нормальна, включаємо в базу, оновлюємо середнє
+#   obj >= avg × 10 → СИГНАЛ аномального об'єму
+# Після сигналу — аналіз хвоста:
+#   obj >= avg × 5  → хвостова, рахуємо, не включаємо поки їх < HALF_CANDLES
+#   хвостових >= HALF_CANDLES → включаємо всі в базу, шукаємо нову аномалію
+#   obj < avg × 5  → нормальна, включаємо в базу
 # ─────────────────────────────────────────────────────────────────────────────
+
 def analyze_volumes(candles, saved_avg):
     """
-    Аналізує об'єми свічок за алгоритмом ковзного середнього з аномаліями.
-    Повертає: (signal_found, signal_candle_idx, tail_count, final_avg)
+    Аналізує об'єми за алгоритмом ковзного середнього з виключенням аномалій.
+
+    Повертає:
+        signal_found      (bool)  — знайдено аномальний об'єм
+        signal_candle_idx (int)   — індекс сигнальної свічки (-1 якщо немає)
+        tail_count        (int)   — кількість свічок з підвищеним об'ємом
+        final_avg         (float) — підсумкове середнє для збереження
     """
     if not candles:
-        return False, -1, 0, saved_avg
+        return False, -1, 0, (saved_avg if saved_avg else 0.0)
 
-    # Ініціалізація середнього: збережене або об'єм першої свічки
     volumes_in_base = []
+
     if saved_avg is not None and saved_avg > 0:
         current_avg = saved_avg
-        # Перша свічка також перевіряється за загальним правилом
-        start_idx = 0
+        start_idx   = 0
     else:
-        # Перший запуск: базове середнє = об'єм свічки [0]
-        first_vol = float(candles[0][5] or 0)
+        first_vol   = float(candles[0][5] or 0)
         current_avg = first_vol if first_vol > 0 else 1.0
         volumes_in_base.append(first_vol)
-        start_idx = 1
+        start_idx   = 1
 
-    signal_found     = False
+    signal_found      = False
     signal_candle_idx = -1
-    tail_count       = 0
-    tail_candles_idx = []
+    tail_count        = 0
+    tail_indices      = []
 
     i = start_idx
     while i < len(candles):
         vol = float(candles[i][5] or 0)
 
         if not signal_found:
-            # ── Режим пошуку аномалії ──
-            if vol >= current_avg * VOLUME_SPIKE_X and current_avg > 0:
-                # Знайдено аномальний об'єм
+            if current_avg > 0 and vol >= current_avg * VOLUME_SPIKE_X:
                 signal_found      = True
                 signal_candle_idx = i
-                tail_count        = 1  # рахуємо саму сигнальну свічку
-                tail_candles_idx  = [i]
+                tail_count        = 1
+                tail_indices      = [i]
             else:
-                # Нормальна свічка → включаємо в базу
                 volumes_in_base.append(vol)
-                if volumes_in_base:
-                    current_avg = sum(volumes_in_base) / len(volumes_in_base)
+                current_avg = sum(volumes_in_base) / len(volumes_in_base)
         else:
-            # ── Режим аналізу хвоста після сигнальної свічки ──
             if vol >= current_avg * VOLUME_TAIL_X:
-                # Хвостова свічка з підвищеним об'ємом
-                tail_candles_idx.append(i)
-                tail_count = len(tail_candles_idx)
-
+                tail_indices.append(i)
+                tail_count = len(tail_indices)
                 if tail_count >= HALF_CANDLES:
-                    # Хвостових >= половини → включаємо всі в базу і шукаємо нову аномалію
-                    for ti in tail_candles_idx:
+                    for ti in tail_indices:
                         volumes_in_base.append(float(candles[ti][5] or 0))
-                    current_avg = sum(volumes_in_base) / len(volumes_in_base) if volumes_in_base else current_avg
-                    # Скидаємо стан пошуку
+                    current_avg       = sum(volumes_in_base) / len(volumes_in_base)
                     signal_found      = False
                     signal_candle_idx = -1
                     tail_count        = 0
-                    tail_candles_idx  = []
+                    tail_indices      = []
             else:
-                # Нормальна свічка після хвоста → включаємо в базу
                 volumes_in_base.append(vol)
-                if volumes_in_base:
-                    current_avg = sum(volumes_in_base) / len(volumes_in_base)
+                current_avg = sum(volumes_in_base) / len(volumes_in_base)
 
         i += 1
 
-    # Підсумкове середнє для збереження
-    final_avg = sum(volumes_in_base) / len(volumes_in_base) if volumes_in_base else current_avg
+    final_avg = (sum(volumes_in_base) / len(volumes_in_base)
+                 if volumes_in_base else current_avg)
 
     return signal_found, signal_candle_idx, tail_count, final_avg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 6: ПЕРЕВІРКА УМОВИ ЦІНИ (ріст min → max >= 50% за 6 год)
-# Повертає: (відсоток_росту, ціна_макс, час_свічки_макс_UTC)
+# БЛОК 6: АНАЛІЗ ЦІНИ — РІСТ MIN→MAX ЗА 6 ГОДИН
+# Використовується в обох блоках пошуку
+# Повертає: відсоток росту, ціну максимуму, UTC час свічки з максимумом
 # ─────────────────────────────────────────────────────────────────────────────
-def analyze_price(candles):
-    """Розраховує ріст ціни від мінімуму до максимуму за весь період свічок"""
+
+def analyze_price_up(candles):
+    """
+    Розраховує ріст від глобального мінімуму до глобального максимуму.
+
+    Повертає:
+        growth_pct (float) — відсоток росту min→max
+        max_price  (float) — ціна максимуму (high)
+        time_str   (str)   — UTC час свічки з максимумом HH:MM
+    """
     try:
-        # Знаходимо глобальний мінімум і максимум по всіх свічках
-        min_price   = float("inf")
-        max_price   = 0.0
+        min_price     = float("inf")
+        max_price     = 0.0
         max_candle_ts = None
 
         for candle in candles:
@@ -228,172 +245,309 @@ def analyze_price(candles):
             low  = float(candle[3] or 0)
             ts   = int(candle[0])
 
-            if low > 0 and low < min_price:
+            if 0 < low < min_price:
                 min_price = low
             if high > max_price:
-                max_price = high
+                max_price     = high
                 max_candle_ts = ts
 
-        if min_price <= 0 or max_price <= 0:
-            return 0.0, 0.0, None
+        if min_price <= 0 or max_price <= 0 or min_price == float("inf"):
+            return 0.0, 0.0, "--:--"
 
         growth_pct = (max_price - min_price) / min_price * 100
-
-        # Перетворюємо timestamp (мілісекунди) → UTC час
-        max_time_utc = datetime.fromtimestamp(max_candle_ts / 1000, tz=timezone.utc)
-        time_str = max_time_utc.strftime("%H:%M")
+        time_str   = datetime.fromtimestamp(
+            max_candle_ts / 1000, tz=timezone.utc
+        ).strftime("%H:%M")
 
         return growth_pct, max_price, time_str
 
     except Exception as e:
-        print(f"Виняток analyze_price: {e}")
-        return 0.0, 0.0, None
+        print(f"Виняток analyze_price_up: {e}")
+        return 0.0, 0.0, "--:--"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 7: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ ДЛЯ ОДНОЇ МОНЕТИ
-# Формат: DOGE+74.3%;max0.10200(14:30);V+10х(5св)
+# БЛОК 7: АНАЛІЗ ЦІНИ — ПАДІННЯ MAX→MIN ЗА 6 ГОДИН
+# Використовується лише в блоці 2 для пошуку сильних падінь
+# Повертає: відсоток падіння, ціну мінімуму, UTC час свічки з мінімумом
 # ─────────────────────────────────────────────────────────────────────────────
-def format_signal_line(inst_id, growth_pct, max_price, max_time, tail_count, signal_last):
-    """Формує рядок повідомлення для однієї монети-сигналу"""
 
-    # Скорочуємо назву: DOGE-USDT-SWAP → DOGE
-    name = inst_id.replace("-USDT-SWAP", "")
+def analyze_price_down(candles):
+    """
+    Розраховує падіння від глобального максимуму до глобального мінімуму.
 
-    # Форматуємо ціну максимуму: до 5 значущих цифр
-    if max_price >= 1:
-        price_str = f"{max_price:.4f}"
-    elif max_price >= 0.01:
-        price_str = f"{max_price:.5f}"
+    Повертає:
+        drop_pct   (float) — відсоток падіння max→min
+        min_price  (float) — ціна мінімуму (low)
+        time_str   (str)   — UTC час свічки з мінімумом HH:MM
+    """
+    try:
+        max_price     = 0.0
+        min_price     = float("inf")
+        min_candle_ts = None
+
+        for candle in candles:
+            high = float(candle[2] or 0)
+            low  = float(candle[3] or 0)
+            ts   = int(candle[0])
+
+            if high > max_price:
+                max_price = high
+            if 0 < low < min_price:
+                min_price     = low
+                min_candle_ts = ts
+
+        if max_price <= 0 or min_price <= 0 or min_price == float("inf"):
+            return 0.0, 0.0, "--:--"
+
+        drop_pct = (max_price - min_price) / max_price * 100
+        time_str = datetime.fromtimestamp(
+            min_candle_ts / 1000, tz=timezone.utc
+        ).strftime("%H:%M")
+
+        return drop_pct, min_price, time_str
+
+    except Exception as e:
+        print(f"Виняток analyze_price_down: {e}")
+        return 0.0, 0.0, "--:--"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# БЛОК 8: ФОРМАТУВАННЯ ЦІНИ ДО ПОТРІБНОЇ КІЛЬКОСТІ ЗНАКІВ
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fmt_price(price):
+    """Форматує ціну залежно від її величини"""
+    if price >= 1.0:
+        return f"{price:.4f}"
+    elif price >= 0.01:
+        return f"{price:.5f}"
     else:
-        price_str = f"{max_price:.7f}"
+        return f"{price:.7f}"
 
-    # Формуємо кратність об'єму (ціле число)
-    vol_part = f"V+10х"
 
-    if signal_last:
-        # Сигнальна свічка — остання в запиті
-        return f"{name}+{growth_pct:.1f}%;max{price_str}({max_time});{vol_part}"
+# ─────────────────────────────────────────────────────────────────────────────
+# БЛОК 9: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ БЛОКУ 1 (памп з об'ємами)
+# Формат: DOGE+74.3%;max0.10200(14:30);V+10х
+#      або DOGE+74.3%;max0.10200(14:30);V+10х(5св)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def format_line_block1(inst_id, growth_pct, max_price, max_time, tail_count, signal_is_last):
+    """Формує рядок сигналу для блоку 1 (памп з аномальним об'ємом)"""
+    name      = inst_id.replace("-USDT-SWAP", "")
+    price_str = fmt_price(max_price)
+    base      = f"{name}+{growth_pct:.1f}%;max{price_str}({max_time});V+10х"
+    if signal_is_last:
+        return base
     else:
-        # Після сигнальної є ще хвостові свічки
-        return f"{name}+{growth_pct:.1f}%;max{price_str}({max_time});{vol_part}({tail_count}св)"
+        return f"{base}({tail_count}св)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 8: НАДСИЛАННЯ ПОВІДОМЛЕННЯ У TELEGRAM (plain text — без parse_mode)
+# БЛОК 10: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ БЛОКУ 2 (рух без об'ємів)
+# Ріст:    RLS+50.3%;max0.10200;14:14
+# Падіння: RLS-50.3%;min0.10200;14:14
 # ─────────────────────────────────────────────────────────────────────────────
+
+def format_line_block2(inst_id, pct, price, time_str, is_up):
+    """Формує рядок сигналу для блоку 2 (рух ціни без перевірки об'ємів)"""
+    name      = inst_id.replace("-USDT-SWAP", "")
+    price_str = fmt_price(price)
+    if is_up:
+        return f"{name}+{pct:.1f}%;max{price_str};{time_str}"
+    else:
+        return f"{name}-{pct:.1f}%;min{price_str};{time_str}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# БЛОК 11: НАДСИЛАННЯ ПОВІДОМЛЕННЯ У TELEGRAM (plain text)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def send_telegram(text):
     """Надсилає текстове повідомлення у Telegram без форматування"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"Telegram не налаштовано. Повідомлення:\n{text}")
+        return
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text":    text,
-    }
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
         resp = requests.post(url, data=data, timeout=15)
-        if resp.status_code != 200:
-            print(f"Telegram помилка: {resp.text}")
+        if resp.status_code == 200:
+            print("Telegram: надіслано успішно")
         else:
-            print("Telegram: повідомлення надіслано")
+            print(f"Telegram помилка {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"Виняток Telegram: {e}")
+        print(f"Виняток send_telegram: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 9: ГОЛОВНА ЛОГІКА — ОРКЕСТРАЦІЯ ВСІХ БЛОКІВ
+# БЛОК 12: ГОЛОВНА ЛОГІКА — ОРКЕСТРАЦІЯ ВСІХ БЛОКІВ
+# Порядок роботи:
+#   1. Завантажуємо state.json
+#   2. Отримуємо список інструментів
+#   3. Для кожного інструменту:
+#      а) відсівка за ціною < 5 USDT
+#      б) отримуємо свічки (один запит — використовуємо для обох блоків)
+#      в) БЛОК 1: перевірка росту + аналіз об'ємів
+#      г) БЛОК 2: перевірка росту АБО падіння (якщо не в блоці 1)
+#   4. Зберігаємо state.json
+#   5. Формуємо і надсилаємо повідомлення
 # ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    now_utc    = datetime.now(timezone.utc)
-    now_str    = now_utc.strftime("%Y-%m-%d  UTC=%H:%M")
-    print(f"Запуск OKX_PAMP_bot | {now_str}")
+    now_utc = datetime.now(timezone.utc)
+    now_str = now_utc.strftime("%Y-%m-%d  UTC=%H:%M")
+    print(f"=== OKX_PAMP_bot старт | {now_str} ===")
 
-    # ── Крок 1: завантажуємо збережені середні об'єми
+    # ── 1. Завантажуємо збережені середні об'єми
     state = load_state()
+    print(f"Завантажено середніх з state.json: {len(state)}")
 
-    # ── Крок 2: отримуємо всі SWAP-інструменти
+    # ── 2. Отримуємо список інструментів
     instruments = get_all_swap_instruments()
-    print(f"Інструментів SWAP: {len(instruments)}")
+    print(f"Інструментів USDT-SWAP: {len(instruments)}")
     if not instruments:
-        print("Немає інструментів, завершення")
+        print("Список порожній — завершення")
         return
 
-    signals = []  # список знайдених сигналів
+    signals_b1  = []   # сигнали блоку 1 (памп з об'ємами)
+    signals_b2  = []   # сигнали блоку 2 (рух без об'ємів)
+    found_b1_ids = set()  # instId що вже є в блоці 1 — для уникнення дублів
 
-    # ── Крок 3: аналізуємо кожен інструмент
+    # ── 3. Аналізуємо кожен інструмент
     for inst_id in instruments:
 
-        # 3а. Перевірка ціни < 5 USDT (швидка відсівка)
+        # 3а. Відсівка за ціною < 5 USDT
         price = get_ticker_price(inst_id)
         time.sleep(REQUEST_DELAY)
 
         if price is None or price <= 0 or price >= MAX_PRICE_USDT:
             continue
 
-        # 3б. Отримуємо свічки
+        # 3б. Отримуємо свічки — один запит, використовуємо в обох блоках
         candles = get_candles(inst_id)
         time.sleep(REQUEST_DELAY)
 
         if len(candles) < 4:
             continue
 
-        # 3в. Аналіз ціни: ріст min→max >= 50%
-        growth_pct, max_price, max_time = analyze_price(candles)
-        if growth_pct < GROWTH_THRESHOLD:
+        # ── БЛОК 1: памп з аномальним об'ємом ──────────────────────────────
+
+        # Перевірка росту ціни min→max >= 50%
+        growth_pct, max_price, max_time = analyze_price_up(candles)
+
+        if growth_pct >= GROWTH_THRESHOLD:
+            # Аналіз об'ємів за ковзним середнім
+            saved_avg = state.get(inst_id, None)
+            signal_found, signal_idx, tail_count, final_avg = analyze_volumes(candles, saved_avg)
+
+            # Зберігаємо оновлене середнє завжди
+            state[inst_id] = final_avg
+
+            if signal_found:
+                signal_is_last = (signal_idx == len(candles) - 1)
+                print(f"  [B1] {inst_id}: +{growth_pct:.1f}% | хвіст={tail_count}св")
+                signals_b1.append({
+                    "inst_id":        inst_id,
+                    "growth_pct":     growth_pct,
+                    "max_price":      max_price,
+                    "max_time":       max_time,
+                    "tail_count":     tail_count,
+                    "signal_is_last": signal_is_last,
+                })
+                found_b1_ids.add(inst_id)
+                # Переходимо до наступного інструменту — в блок 2 не додаємо
+                continue
+        else:
+            # Ріст не досягає порогу — оновлюємо середнє все одно
+            saved_avg = state.get(inst_id, None)
+            _, _, _, final_avg = analyze_volumes(candles, saved_avg)
+            state[inst_id] = final_avg
+
+        # ── БЛОК 2: рух ціни без перевірки об'ємів ─────────────────────────
+        # Пропускаємо якщо вже є в блоці 1
+        if inst_id in found_b1_ids:
             continue
 
-        print(f"  {inst_id}: ціна ОК ({price:.4f}), ріст {growth_pct:.1f}%")
+        # Перевірка росту min→max >= 50%
+        up_pct, up_price, up_time = analyze_price_up(candles)
+        # Перевірка падіння max→min >= 50%
+        dn_pct, dn_price, dn_time = analyze_price_down(candles)
 
-        # 3г. Аналіз об'ємів за ковзним середнім
-        saved_avg = state.get(inst_id, None)
-        signal_found, signal_idx, tail_count, final_avg = analyze_volumes(candles, saved_avg)
+        best_up = up_pct >= GROWTH_THRESHOLD
+        best_dn = dn_pct >= GROWTH_THRESHOLD
 
-        # 3д. Зберігаємо оновлене середнє незалежно від сигналу
-        state[inst_id] = final_avg
-
-        if not signal_found:
+        if not best_up and not best_dn:
             continue
 
-        # 3е. Перевіряємо: сигнальна свічка остання чи є хвіст
-        signal_is_last = (signal_idx == len(candles) - 1)
+        # Якщо обидві умови виконуються — беремо ту що більша за абсолютом
+        if best_up and best_dn:
+            is_up = up_pct >= dn_pct
+        elif best_up:
+            is_up = True
+        else:
+            is_up = False
 
-        print(f"    СИГНАЛ! idx={signal_idx}, хвіст={tail_count}св, остання={signal_is_last}")
+        pct       = up_pct   if is_up else dn_pct
+        sig_price = up_price if is_up else dn_price
+        sig_time  = up_time  if is_up else dn_time
 
-        signals.append({
-            "inst_id":        inst_id,
-            "growth_pct":     growth_pct,
-            "max_price":      max_price,
-            "max_time":       max_time,
-            "tail_count":     tail_count,
-            "signal_is_last": signal_is_last,
+        direction = "UP" if is_up else "DN"
+        print(f"  [B2] {inst_id}: {direction} {pct:.1f}%")
+
+        signals_b2.append({
+            "inst_id":  inst_id,
+            "pct":      pct,
+            "price":    sig_price,
+            "time_str": sig_time,
+            "is_up":    is_up,
         })
 
-    # ── Крок 4: зберігаємо оновлений стан
+    # ── 4. Зберігаємо оновлений state.json
     save_state(state)
+    print(f"state.json збережено ({len(state)} пар)")
 
-    # ── Крок 5: формуємо та надсилаємо повідомлення
-    if not signals:
-        # Нічого не знайдено — тихе повідомлення
+    # ── 5. Формуємо повідомлення
+    has_b1 = len(signals_b1) > 0
+    has_b2 = len(signals_b2) > 0
+
+    if not has_b1 and not has_b2:
+        # Нічого не знайдено
         msg = now_str
-        print(f"Сигналів не знайдено")
+        print("Сигналів не знайдено")
     else:
-        # Сортуємо за відсотком росту (від більшого до меншого)
-        signals.sort(key=lambda x: x["growth_pct"], reverse=True)
         lines = []
-        for s in signals:
-            line = format_signal_line(
-                s["inst_id"],
-                s["growth_pct"],
-                s["max_price"],
-                s["max_time"],
-                s["tail_count"],
-                s["signal_is_last"],
-            )
-            lines.append(line)
-            print(f"  {line}")
+
+        # Блок 1 — сортуємо за відсотком росту (більший вгорі)
+        if has_b1:
+            signals_b1.sort(key=lambda x: x["growth_pct"], reverse=True)
+            for s in signals_b1:
+                line = format_line_block1(
+                    s["inst_id"], s["growth_pct"], s["max_price"],
+                    s["max_time"], s["tail_count"], s["signal_is_last"],
+                )
+                lines.append(line)
+                print(f"  >> [B1] {line}")
+
+        # Порожній рядок між блоками якщо обидва є
+        if has_b1 and has_b2:
+            lines.append("")
+
+        # Блок 2 — сортуємо за відсотком (більший вгорі)
+        if has_b2:
+            signals_b2.sort(key=lambda x: x["pct"], reverse=True)
+            for s in signals_b2:
+                line = format_line_block2(
+                    s["inst_id"], s["pct"], s["price"],
+                    s["time_str"], s["is_up"],
+                )
+                lines.append(line)
+                print(f"  >> [B2] {line}")
+
         msg = "\n".join(lines)
 
     send_telegram(msg)
-    print("Завершено")
+    print("=== Завершено ===")
 
 
 if __name__ == "__main__":

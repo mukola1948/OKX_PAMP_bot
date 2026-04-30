@@ -36,12 +36,12 @@ OKX_BASE_URL     = "https://www.okx.com"
 STATE_FILE       = "state.json"
 
 CANDLE_BAR       = "15m"
-CANDLES_COUNT    = 24                      # 24 свічки × 15хв = 6 годин
+CANDLES_COUNT    = 32                      # 32 свічки × 15хв = 8 годин
 MAX_PRICE_USDT   = 5.0                     # максимально допустима ціна монети
 GROWTH_THRESHOLD = 50.0                    # мінімальний ріст/падіння у відсотках
 VOLUME_SPIKE_X   = 10.0                    # кратність аномального об'єму
 VOLUME_TAIL_X    = 5.0                     # кратність хвостових свічок
-HALF_CANDLES     = CANDLES_COUNT // 2      # половина від кількості свічок = 12
+HALF_CANDLES     = CANDLES_COUNT // 2      # половина від кількості свічок = 16
 REQUEST_DELAY    = 0.12                    # затримка між запитами (rate limit OKX)
 
 

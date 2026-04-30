@@ -239,45 +239,57 @@ def analyze_volumes(candles, saved_avg):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 7: АНАЛІЗ ЦІНИ — РІСТ MIN→MAX ЗА 6 ГОДИН
+# Алгоритм: рухаємось зліва направо, відслідковуємо поточний мінімум.
+# Для кожної свічки рахуємо ріст від running_min до high поточної свічки.
+# Гарантія: мінімум ЗАВЖДИ хронологічно раніше максимуму.
 # Повертає: відсоток росту, ціну max, час свічки з min, час свічки з max
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_price_up(candles):
     """
-    Розраховує ріст від глобального мінімуму до глобального максимуму.
+    Розраховує найбільший ріст де мінімум хронологічно раніше максимуму.
+    Рухається зліва направо, відслідковує поточний мінімум (running_min).
 
     Повертає:
-        growth_pct (float) — відсоток росту min→max
-        max_price  (float) — ціна максимуму (high)
-        min_time   (str)   — UTC час свічки з мінімумом HH:MM (точка відліку)
-        max_time   (str)   — UTC час свічки з максимумом HH:MM
+        best_pct      (float) — найбільший відсоток росту min→max
+        best_max      (float) — ціна максимуму найкращого росту
+        best_min_time (str)   — UTC час свічки з мінімумом (точка відліку)
+        best_max_time (str)   — UTC час свічки з максимумом
     """
     try:
-        min_price     = float("inf")
-        max_price     = 0.0
-        min_candle_ts = None
-        max_candle_ts = None
+        best_pct      = 0.0
+        best_max      = 0.0
+        best_min_ts   = None
+        best_max_ts   = None
+
+        running_min    = float("inf")
+        running_min_ts = None
 
         for candle in candles:
             high = float(candle[2] or 0)
             low  = float(candle[3] or 0)
             ts   = int(candle[0])
 
-            if 0 < low < min_price:
-                min_price     = low
-                min_candle_ts = ts
-            if high > max_price:
-                max_price     = high
-                max_candle_ts = ts
+            # Оновлюємо поточний мінімум (ліва точка відліку)
+            if 0 < low < running_min:
+                running_min    = low
+                running_min_ts = ts
 
-        if min_price <= 0 or max_price <= 0 or min_price == float("inf"):
+            # Рахуємо ріст від поточного мінімуму до high цієї свічки
+            if running_min > 0 and high > 0 and running_min_ts is not None:
+                # Максимум повинен бути пізніше або на тій самій свічці що мінімум
+                if ts >= running_min_ts:
+                    pct = (high - running_min) / running_min * 100
+                    if pct > best_pct:
+                        best_pct    = pct
+                        best_max    = high
+                        best_min_ts = running_min_ts
+                        best_max_ts = ts
+
+        if best_pct <= 0 or best_min_ts is None or best_max_ts is None:
             return 0.0, 0.0, "--:--", "--:--"
 
-        growth_pct = (max_price - min_price) / min_price * 100
-        min_time   = ts_to_utc(min_candle_ts)
-        max_time   = ts_to_utc(max_candle_ts)
-
-        return growth_pct, max_price, min_time, max_time
+        return best_pct, best_max, ts_to_utc(best_min_ts), ts_to_utc(best_max_ts)
 
     except (ValueError, TypeError, IndexError, ZeroDivisionError) as e:
         print(f"Виняток analyze_price_up: {e}")
@@ -286,45 +298,57 @@ def analyze_price_up(candles):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 8: АНАЛІЗ ЦІНИ — ПАДІННЯ MAX→MIN ЗА 6 ГОДИН
+# Алгоритм: рухаємось зліва направо, відслідковуємо поточний максимум.
+# Для кожної свічки рахуємо падіння від running_max до low поточної свічки.
+# Гарантія: максимум ЗАВЖДИ хронологічно раніше мінімуму.
 # Повертає: відсоток падіння, ціну min, час свічки з max, час свічки з min
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_price_down(candles):
     """
-    Розраховує падіння від глобального максимуму до глобального мінімуму.
+    Розраховує найбільше падіння де максимум хронологічно раніше мінімуму.
+    Рухається зліва направо, відслідковує поточний максимум (running_max).
 
     Повертає:
-        drop_pct   (float) — відсоток падіння max→min
-        min_price  (float) — ціна мінімуму (low)
-        max_time   (str)   — UTC час свічки з максимумом HH:MM (точка відліку)
-        min_time   (str)   — UTC час свічки з мінімумом HH:MM
+        best_pct      (float) — найбільший відсоток падіння max→min
+        best_min      (float) — ціна мінімуму найкращого падіння
+        best_max_time (str)   — UTC час свічки з максимумом (точка відліку)
+        best_min_time (str)   — UTC час свічки з мінімумом
     """
     try:
-        max_price     = 0.0
-        min_price     = float("inf")
-        max_candle_ts = None
-        min_candle_ts = None
+        best_pct      = 0.0
+        best_min      = 0.0
+        best_max_ts   = None
+        best_min_ts   = None
+
+        running_max    = 0.0
+        running_max_ts = None
 
         for candle in candles:
             high = float(candle[2] or 0)
             low  = float(candle[3] or 0)
             ts   = int(candle[0])
 
-            if high > max_price:
-                max_price     = high
-                max_candle_ts = ts
-            if 0 < low < min_price:
-                min_price     = low
-                min_candle_ts = ts
+            # Оновлюємо поточний максимум (ліва точка відліку)
+            if high > running_max:
+                running_max    = high
+                running_max_ts = ts
 
-        if max_price <= 0 or min_price <= 0 or min_price == float("inf"):
+            # Рахуємо падіння від поточного максимуму до low цієї свічки
+            if running_max > 0 and low > 0 and running_max_ts is not None:
+                # Мінімум повинен бути пізніше або на тій самій свічці що максимум
+                if ts >= running_max_ts:
+                    pct = (running_max - low) / running_max * 100
+                    if pct > best_pct:
+                        best_pct    = pct
+                        best_min    = low
+                        best_max_ts = running_max_ts
+                        best_min_ts = ts
+
+        if best_pct <= 0 or best_max_ts is None or best_min_ts is None:
             return 0.0, 0.0, "--:--", "--:--"
 
-        drop_pct = (max_price - min_price) / max_price * 100
-        max_time = ts_to_utc(max_candle_ts)
-        min_time = ts_to_utc(min_candle_ts)
-
-        return drop_pct, min_price, max_time, min_time
+        return best_pct, best_min, ts_to_utc(best_max_ts), ts_to_utc(best_min_ts)
 
     except (ValueError, TypeError, IndexError, ZeroDivisionError) as e:
         print(f"Виняток analyze_price_down: {e}")

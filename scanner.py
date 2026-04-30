@@ -57,7 +57,7 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
-        except Exception as e:
+        except (OSError, ValueError, json.JSONDecodeError) as e:
             print(f"Помилка читання state.json: {e}")
             return {}
     return {}
@@ -68,7 +68,7 @@ def save_state(state):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
-    except Exception as e:
+    except (OSError, TypeError, ValueError) as e:
         print(f"Помилка збереження state.json: {e}")
 
 
@@ -92,7 +92,7 @@ def get_all_swap_instruments():
             if inst_id.endswith("-USDT-SWAP"):
                 result.append(inst_id)
         return result
-    except Exception as e:
+    except (requests.RequestException, ValueError, KeyError) as e:
         print(f"Виняток get_all_swap_instruments: {e}")
         return []
 
@@ -112,7 +112,7 @@ def get_ticker_price(inst_id):
             return None
         val = data["data"][0].get("last", 0)
         return float(val) if val else None
-    except Exception:
+    except (requests.RequestException, ValueError, KeyError, TypeError, IndexError):
         return None
 
 
@@ -139,7 +139,7 @@ def get_candles(inst_id):
         candles = data["data"]
         candles.reverse()   # тепер [0]=найстаріша, [23]=найновіша
         return candles
-    except Exception as e:
+    except (requests.RequestException, ValueError, KeyError) as e:
         print(f"Виняток get_candles {inst_id}: {e}")
         return []
 
@@ -154,7 +154,7 @@ def ts_to_utc(ts_ms):
         return datetime.fromtimestamp(
             int(ts_ms) / 1000, tz=timezone.utc
         ).strftime("%H:%M")
-    except Exception:
+    except (ValueError, TypeError, OSError):
         return "--:--"
 
 
@@ -279,7 +279,7 @@ def analyze_price_up(candles):
 
         return growth_pct, max_price, min_time, max_time
 
-    except Exception as e:
+    except (ValueError, TypeError, IndexError, ZeroDivisionError) as e:
         print(f"Виняток analyze_price_up: {e}")
         return 0.0, 0.0, "--:--", "--:--"
 
@@ -326,7 +326,7 @@ def analyze_price_down(candles):
 
         return drop_pct, min_price, max_time, min_time
 
-    except Exception as e:
+    except (ValueError, TypeError, IndexError, ZeroDivisionError) as e:
         print(f"Виняток analyze_price_down: {e}")
         return 0.0, 0.0, "--:--", "--:--"
 
@@ -400,7 +400,7 @@ def send_telegram(text):
             print("Telegram: надіслано успішно")
         else:
             print(f"Telegram помилка {resp.status_code}: {resp.text}")
-    except Exception as e:
+    except (requests.RequestException, OSError) as e:
         print(f"Виняток send_telegram: {e}")
 
 

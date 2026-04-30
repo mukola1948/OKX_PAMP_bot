@@ -6,11 +6,14 @@
 #   1. Поточна ціна < 5 USDT
 #   2. Ріст ціни min→max >= 50% за 6 годин (24 свічки × 15хв)
 #   3. Аномальний об'єм >= 10х від ковзного середнього
+#   Формат: DOGE+74.3%;max0.10200(03:45-14:30);V+10х
 #
 # БЛОК 2 (рух без перевірки об'ємів):
 #   1. Поточна ціна < 5 USDT
 #   2. Ріст min→max >= 50% АБО падіння max→min >= 50% за 6 годин
 #   3. Монети що вже є в блоці 1 — не дублюються
+#   Формат ріст:    BSB+52.7%;max0.61520;03:45-14:30
+#   Формат падіння: BSB-52.7%;min0.61520;03:45-14:30
 #
 # Збереження: середній об'єм кожної пари зберігається у state.json між запусками
 # =============================================================================
@@ -134,7 +137,7 @@ def get_candles(inst_id):
         if data.get("code") != "0" or not data.get("data"):
             return []
         candles = data["data"]
-        candles.reverse()
+        candles.reverse()   # тепер [0]=найстаріша, [23]=найновіша
         return candles
     except Exception as e:
         print(f"Виняток get_candles {inst_id}: {e}")
@@ -142,7 +145,21 @@ def get_candles(inst_id):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 5: АЛГОРИТМ КОВЗНОГО СЕРЕДНЬОГО ОБ'ЄМІВ З ВИКЛЮЧЕННЯМ АНОМАЛІЙ
+# БЛОК 5: ДОПОМІЖНА ФУНКЦІЯ — TIMESTAMP В РЯДОК UTC HH:MM
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ts_to_utc(ts_ms):
+    """Перетворює timestamp у мілісекундах на рядок UTC HH:MM"""
+    try:
+        return datetime.fromtimestamp(
+            int(ts_ms) / 1000, tz=timezone.utc
+        ).strftime("%H:%M")
+    except Exception:
+        return "--:--"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# БЛОК 6: АЛГОРИТМ КОВЗНОГО СЕРЕДНЬОГО ОБ'ЄМІВ З ВИКЛЮЧЕННЯМ АНОМАЛІЙ
 #
 # Стартове середнє = збережене з попереднього запуску АБО об'єм свічки [0]
 # Рух від [0] до [23]:
@@ -151,7 +168,7 @@ def get_candles(inst_id):
 # Після сигналу — аналіз хвоста:
 #   obj >= avg × 5  → хвостова, рахуємо, не включаємо поки їх < HALF_CANDLES
 #   хвостових >= HALF_CANDLES → включаємо всі в базу, шукаємо нову аномалію
-#   obj < avg × 5  → нормальна, включаємо в базу
+#   obj < avg × 5  → нормальна після хвоста, включаємо в базу
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_volumes(candles, saved_avg):
@@ -221,9 +238,8 @@ def analyze_volumes(candles, saved_avg):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 6: АНАЛІЗ ЦІНИ — РІСТ MIN→MAX ЗА 6 ГОДИН
-# Використовується в обох блоках пошуку
-# Повертає: відсоток росту, ціну максимуму, UTC час свічки з максимумом
+# БЛОК 7: АНАЛІЗ ЦІНИ — РІСТ MIN→MAX ЗА 6 ГОДИН
+# Повертає: відсоток росту, ціну max, час свічки з min, час свічки з max
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_price_up(candles):
@@ -233,11 +249,13 @@ def analyze_price_up(candles):
     Повертає:
         growth_pct (float) — відсоток росту min→max
         max_price  (float) — ціна максимуму (high)
-        time_str   (str)   — UTC час свічки з максимумом HH:MM
+        min_time   (str)   — UTC час свічки з мінімумом HH:MM (точка відліку)
+        max_time   (str)   — UTC час свічки з максимумом HH:MM
     """
     try:
         min_price     = float("inf")
         max_price     = 0.0
+        min_candle_ts = None
         max_candle_ts = None
 
         for candle in candles:
@@ -246,30 +264,29 @@ def analyze_price_up(candles):
             ts   = int(candle[0])
 
             if 0 < low < min_price:
-                min_price = low
+                min_price     = low
+                min_candle_ts = ts
             if high > max_price:
                 max_price     = high
                 max_candle_ts = ts
 
         if min_price <= 0 or max_price <= 0 or min_price == float("inf"):
-            return 0.0, 0.0, "--:--"
+            return 0.0, 0.0, "--:--", "--:--"
 
         growth_pct = (max_price - min_price) / min_price * 100
-        time_str   = datetime.fromtimestamp(
-            max_candle_ts / 1000, tz=timezone.utc
-        ).strftime("%H:%M")
+        min_time   = ts_to_utc(min_candle_ts)
+        max_time   = ts_to_utc(max_candle_ts)
 
-        return growth_pct, max_price, time_str
+        return growth_pct, max_price, min_time, max_time
 
     except Exception as e:
         print(f"Виняток analyze_price_up: {e}")
-        return 0.0, 0.0, "--:--"
+        return 0.0, 0.0, "--:--", "--:--"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 7: АНАЛІЗ ЦІНИ — ПАДІННЯ MAX→MIN ЗА 6 ГОДИН
-# Використовується лише в блоці 2 для пошуку сильних падінь
-# Повертає: відсоток падіння, ціну мінімуму, UTC час свічки з мінімумом
+# БЛОК 8: АНАЛІЗ ЦІНИ — ПАДІННЯ MAX→MIN ЗА 6 ГОДИН
+# Повертає: відсоток падіння, ціну min, час свічки з max, час свічки з min
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_price_down(candles):
@@ -279,11 +296,13 @@ def analyze_price_down(candles):
     Повертає:
         drop_pct   (float) — відсоток падіння max→min
         min_price  (float) — ціна мінімуму (low)
-        time_str   (str)   — UTC час свічки з мінімумом HH:MM
+        max_time   (str)   — UTC час свічки з максимумом HH:MM (точка відліку)
+        min_time   (str)   — UTC час свічки з мінімумом HH:MM
     """
     try:
         max_price     = 0.0
         min_price     = float("inf")
+        max_candle_ts = None
         min_candle_ts = None
 
         for candle in candles:
@@ -292,28 +311,28 @@ def analyze_price_down(candles):
             ts   = int(candle[0])
 
             if high > max_price:
-                max_price = high
+                max_price     = high
+                max_candle_ts = ts
             if 0 < low < min_price:
                 min_price     = low
                 min_candle_ts = ts
 
         if max_price <= 0 or min_price <= 0 or min_price == float("inf"):
-            return 0.0, 0.0, "--:--"
+            return 0.0, 0.0, "--:--", "--:--"
 
         drop_pct = (max_price - min_price) / max_price * 100
-        time_str = datetime.fromtimestamp(
-            min_candle_ts / 1000, tz=timezone.utc
-        ).strftime("%H:%M")
+        max_time = ts_to_utc(max_candle_ts)
+        min_time = ts_to_utc(min_candle_ts)
 
-        return drop_pct, min_price, time_str
+        return drop_pct, min_price, max_time, min_time
 
     except Exception as e:
         print(f"Виняток analyze_price_down: {e}")
-        return 0.0, 0.0, "--:--"
+        return 0.0, 0.0, "--:--", "--:--"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 8: ФОРМАТУВАННЯ ЦІНИ ДО ПОТРІБНОЇ КІЛЬКОСТІ ЗНАКІВ
+# БЛОК 9: ФОРМАТУВАННЯ ЦІНИ ДО ПОТРІБНОЇ КІЛЬКОСТІ ЗНАКІВ
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fmt_price(price):
@@ -327,16 +346,19 @@ def fmt_price(price):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 9: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ БЛОКУ 1 (памп з об'ємами)
-# Формат: DOGE+74.3%;max0.10200(14:30);V+10х
-#      або DOGE+74.3%;max0.10200(14:30);V+10х(5св)
+# БЛОК 10: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ БЛОКУ 1 (памп з об'ємами)
+# Формат: DOGE+74.3%;max0.10200(03:45-14:30);V+10х
+#      або DOGE+74.3%;max0.10200(03:45-14:30);V+10х(5св)
+# де 03:45 = час свічки з мінімумом (точка відліку росту)
+#    14:30 = час свічки з максимумом
 # ─────────────────────────────────────────────────────────────────────────────
 
-def format_line_block1(inst_id, growth_pct, max_price, max_time, tail_count, signal_is_last):
+def format_line_block1(inst_id, growth_pct, max_price, min_time, max_time,
+                       tail_count, signal_is_last):
     """Формує рядок сигналу для блоку 1 (памп з аномальним об'ємом)"""
     name      = inst_id.replace("-USDT-SWAP", "")
     price_str = fmt_price(max_price)
-    base      = f"{name}+{growth_pct:.1f}%;max{price_str}({max_time});V+10х"
+    base      = f"{name}+{growth_pct:.1f}%;max{price_str}({min_time}-{max_time});V+10х"
     if signal_is_last:
         return base
     else:
@@ -344,23 +366,25 @@ def format_line_block1(inst_id, growth_pct, max_price, max_time, tail_count, sig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 10: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ БЛОКУ 2 (рух без об'ємів)
-# Ріст:    RLS+50.3%;max0.10200;14:14
-# Падіння: RLS-50.3%;min0.10200;14:14
+# БЛОК 11: ФОРМАТУВАННЯ РЯДКА СИГНАЛУ БЛОКУ 2 (рух без об'ємів)
+# Ріст:    BSB+52.7%;max0.61520;03:45-14:30
+# Падіння: BSB-52.7%;min0.61520;03:45-14:30
+# де перший час = точка відліку (min для росту, max для падіння)
+#    другий час = кінцева точка (max для росту, min для падіння)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def format_line_block2(inst_id, pct, price, time_str, is_up):
+def format_line_block2(inst_id, pct, price, start_time, end_time, is_up):
     """Формує рядок сигналу для блоку 2 (рух ціни без перевірки об'ємів)"""
     name      = inst_id.replace("-USDT-SWAP", "")
     price_str = fmt_price(price)
     if is_up:
-        return f"{name}+{pct:.1f}%;max{price_str};{time_str}"
+        return f"{name}+{pct:.1f}%;max{price_str};{start_time}-{end_time}"
     else:
-        return f"{name}-{pct:.1f}%;min{price_str};{time_str}"
+        return f"{name}-{pct:.1f}%;min{price_str};{start_time}-{end_time}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 11: НАДСИЛАННЯ ПОВІДОМЛЕННЯ У TELEGRAM (plain text)
+# БЛОК 12: НАДСИЛАННЯ ПОВІДОМЛЕННЯ У TELEGRAM (plain text)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_telegram(text):
@@ -381,13 +405,13 @@ def send_telegram(text):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 12: ГОЛОВНА ЛОГІКА — ОРКЕСТРАЦІЯ ВСІХ БЛОКІВ
+# БЛОК 13: ГОЛОВНА ЛОГІКА — ОРКЕСТРАЦІЯ ВСІХ БЛОКІВ
 # Порядок роботи:
 #   1. Завантажуємо state.json
 #   2. Отримуємо список інструментів
 #   3. Для кожного інструменту:
 #      а) відсівка за ціною < 5 USDT
-#      б) отримуємо свічки (один запит — використовуємо для обох блоків)
+#      б) отримуємо свічки (один запит для обох блоків)
 #      в) БЛОК 1: перевірка росту + аналіз об'ємів
 #      г) БЛОК 2: перевірка росту АБО падіння (якщо не в блоці 1)
 #   4. Зберігаємо state.json
@@ -410,9 +434,9 @@ def main():
         print("Список порожній — завершення")
         return
 
-    signals_b1  = []   # сигнали блоку 1 (памп з об'ємами)
-    signals_b2  = []   # сигнали блоку 2 (рух без об'ємів)
-    found_b1_ids = set()  # instId що вже є в блоці 1 — для уникнення дублів
+    signals_b1   = []      # сигнали блоку 1 (памп з об'ємами)
+    signals_b2   = []      # сигнали блоку 2 (рух без об'ємів)
+    found_b1_ids = set()   # instId що вже є в блоці 1 — для уникнення дублів
 
     # ── 3. Аналізуємо кожен інструмент
     for inst_id in instruments:
@@ -433,46 +457,43 @@ def main():
 
         # ── БЛОК 1: памп з аномальним об'ємом ──────────────────────────────
 
-        # Перевірка росту ціни min→max >= 50%
-        growth_pct, max_price, max_time = analyze_price_up(candles)
+        growth_pct, max_price, min_time, max_time = analyze_price_up(candles)
 
         if growth_pct >= GROWTH_THRESHOLD:
-            # Аналіз об'ємів за ковзним середнім
             saved_avg = state.get(inst_id, None)
-            signal_found, signal_idx, tail_count, final_avg = analyze_volumes(candles, saved_avg)
-
-            # Зберігаємо оновлене середнє завжди
+            signal_found, signal_idx, tail_count, final_avg = analyze_volumes(
+                candles, saved_avg
+            )
             state[inst_id] = final_avg
 
             if signal_found:
                 signal_is_last = (signal_idx == len(candles) - 1)
-                print(f"  [B1] {inst_id}: +{growth_pct:.1f}% | хвіст={tail_count}св")
+                print(f"  [B1] {inst_id}: +{growth_pct:.1f}% | "
+                      f"{min_time}-{max_time} | хвіст={tail_count}св")
                 signals_b1.append({
                     "inst_id":        inst_id,
                     "growth_pct":     growth_pct,
                     "max_price":      max_price,
+                    "min_time":       min_time,
                     "max_time":       max_time,
                     "tail_count":     tail_count,
                     "signal_is_last": signal_is_last,
                 })
                 found_b1_ids.add(inst_id)
-                # Переходимо до наступного інструменту — в блок 2 не додаємо
-                continue
+                continue   # не дублюємо в блок 2
         else:
-            # Ріст не досягає порогу — оновлюємо середнє все одно
+            # Ріст не досяг порогу — оновлюємо середнє все одно
             saved_avg = state.get(inst_id, None)
             _, _, _, final_avg = analyze_volumes(candles, saved_avg)
             state[inst_id] = final_avg
 
         # ── БЛОК 2: рух ціни без перевірки об'ємів ─────────────────────────
-        # Пропускаємо якщо вже є в блоці 1
+
         if inst_id in found_b1_ids:
             continue
 
-        # Перевірка росту min→max >= 50%
-        up_pct, up_price, up_time = analyze_price_up(candles)
-        # Перевірка падіння max→min >= 50%
-        dn_pct, dn_price, dn_time = analyze_price_down(candles)
+        up_pct, up_price, up_min_time, up_max_time = analyze_price_up(candles)
+        dn_pct, dn_price, dn_max_time, dn_min_time = analyze_price_down(candles)
 
         best_up = up_pct >= GROWTH_THRESHOLD
         best_dn = dn_pct >= GROWTH_THRESHOLD
@@ -480,7 +501,7 @@ def main():
         if not best_up and not best_dn:
             continue
 
-        # Якщо обидві умови виконуються — беремо ту що більша за абсолютом
+        # Якщо обидві умови — беремо більшу за абсолютним значенням
         if best_up and best_dn:
             is_up = up_pct >= dn_pct
         elif best_up:
@@ -488,58 +509,63 @@ def main():
         else:
             is_up = False
 
-        pct       = up_pct   if is_up else dn_pct
-        sig_price = up_price if is_up else dn_price
-        sig_time  = up_time  if is_up else dn_time
+        if is_up:
+            pct        = up_pct
+            sig_price  = up_price
+            start_time = up_min_time   # точка відліку = мінімум
+            end_time   = up_max_time   # кінець = максимум
+        else:
+            pct        = dn_pct
+            sig_price  = dn_price
+            start_time = dn_max_time   # точка відліку = максимум
+            end_time   = dn_min_time   # кінець = мінімум
 
         direction = "UP" if is_up else "DN"
-        print(f"  [B2] {inst_id}: {direction} {pct:.1f}%")
+        print(f"  [B2] {inst_id}: {direction} {pct:.1f}% | {start_time}-{end_time}")
 
         signals_b2.append({
-            "inst_id":  inst_id,
-            "pct":      pct,
-            "price":    sig_price,
-            "time_str": sig_time,
-            "is_up":    is_up,
+            "inst_id":    inst_id,
+            "pct":        pct,
+            "price":      sig_price,
+            "start_time": start_time,
+            "end_time":   end_time,
+            "is_up":      is_up,
         })
 
     # ── 4. Зберігаємо оновлений state.json
     save_state(state)
     print(f"state.json збережено ({len(state)} пар)")
 
-    # ── 5. Формуємо повідомлення
+    # ── 5. Формуємо і надсилаємо повідомлення
     has_b1 = len(signals_b1) > 0
     has_b2 = len(signals_b2) > 0
 
     if not has_b1 and not has_b2:
-        # Нічого не знайдено
         msg = now_str
         print("Сигналів не знайдено")
     else:
         lines = []
 
-        # Блок 1 — сортуємо за відсотком росту (більший вгорі)
         if has_b1:
             signals_b1.sort(key=lambda x: x["growth_pct"], reverse=True)
             for s in signals_b1:
                 line = format_line_block1(
                     s["inst_id"], s["growth_pct"], s["max_price"],
-                    s["max_time"], s["tail_count"], s["signal_is_last"],
+                    s["min_time"], s["max_time"],
+                    s["tail_count"], s["signal_is_last"],
                 )
                 lines.append(line)
                 print(f"  >> [B1] {line}")
 
-        # Порожній рядок між блоками якщо обидва є
         if has_b1 and has_b2:
-            lines.append("")
+            lines.append("")   # порожній рядок між блоками
 
-        # Блок 2 — сортуємо за відсотком (більший вгорі)
         if has_b2:
             signals_b2.sort(key=lambda x: x["pct"], reverse=True)
             for s in signals_b2:
                 line = format_line_block2(
                     s["inst_id"], s["pct"], s["price"],
-                    s["time_str"], s["is_up"],
+                    s["start_time"], s["end_time"], s["is_up"],
                 )
                 lines.append(line)
                 print(f"  >> [B2] {line}")

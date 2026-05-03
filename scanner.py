@@ -528,36 +528,29 @@ def main():
         if not best_up and not best_dn:
             continue
 
-        # Якщо обидві умови виконуються — беремо більшу за відсотком
-        if best_up and best_dn:
-            is_up = up_pct >= dn_pct
-        elif best_up:
-            is_up = True
-        else:
-            is_up = False
+        # Якщо обидві умови виконуються одночасно — додаємо ОБИДВА рядки
+        # для цієї монети незалежно один від одного
+        if best_up:
+            print(f"  [B2+] {inst_id}: UP {up_pct:.1f}% | {up_min_time}-{up_max_time}")
+            signals_b2.append({
+                "inst_id":    inst_id,
+                "pct":        up_pct,
+                "price":      up_price,
+                "start_time": up_min_time,   # точка відліку = мінімум
+                "end_time":   up_max_time,   # кінцева точка = максимум
+                "is_up":      True,
+            })
 
-        if is_up:
-            pct        = up_pct
-            sig_price  = up_price
-            start_time = up_min_time   # точка відліку = мінімум
-            end_time   = up_max_time   # кінцева точка = максимум
-        else:
-            pct        = dn_pct
-            sig_price  = dn_price
-            start_time = dn_max_time   # точка відліку = максимум
-            end_time   = dn_min_time   # кінцева точка = мінімум
-
-        direction = "UP" if is_up else "DN"
-        print(f"  [B2] {inst_id}: {direction} {pct:.1f}% | {start_time}-{end_time}")
-
-        signals_b2.append({
-            "inst_id":    inst_id,
-            "pct":        pct,
-            "price":      sig_price,
-            "start_time": start_time,
-            "end_time":   end_time,
-            "is_up":      is_up,
-        })
+        if best_dn:
+            print(f"  [B2-] {inst_id}: DN {dn_pct:.1f}% | {dn_max_time}-{dn_min_time}")
+            signals_b2.append({
+                "inst_id":    inst_id,
+                "pct":        dn_pct,
+                "price":      dn_price,
+                "start_time": dn_max_time,   # точка відліку = максимум
+                "end_time":   dn_min_time,   # кінцева точка = мінімум
+                "is_up":      False,
+            })
 
     # ── 4. Зберігаємо оновлений state.json
     save_state(state)

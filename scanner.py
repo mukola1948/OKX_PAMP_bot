@@ -244,55 +244,62 @@ def analyze_volumes(candles, saved_avg):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 6: АНАЛІЗ ЦІНИ — РІСТ MIN→MAX ЗА 8 ГОДИН
-# Крок 1: знаходимо абсолютний мінімум (low) за всі 32 свічки
-# Крок 2: знаходимо абсолютний максимум (high) за всі 32 свічки
-# Крок 3: перевіряємо що мінімум хронологічно РАНІШЕ максимуму
-# Крок 4: рахуємо ріст (max - min) / min × 100
-# Якщо мінімум пізніше максимуму — умова росту не виконується (повертає 0)
+# Алгоритм одного проходу з running_min зліва направо.
+# На кожній свічці: оновлюємо running_min, рахуємо ріст від running_min до high.
+# Зберігаємо найкращий результат. Гарантія: мінімум ЗАВЖДИ раніше максимуму.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_price_up(candles):
     """
-    Розраховує ріст від абсолютного мінімуму до абсолютного максимуму.
-    Умова: мінімум ОБОВ'ЯЗКОВО хронологічно раніше максимуму.
+    Знаходить найкращий ріст де мінімум хронологічно РАНІШЕ максимуму.
+    Алгоритм одного проходу зліва направо з running_min:
+      — running_min оновлюється на кожній свічці
+      — для кожної свічки рахуємо ріст від running_min до high цієї свічки
+      — зберігаємо найкращий результат (максимальний відсоток)
+    Це дозволяє знайти ріст навіть якщо після максимуму ціна впала
+    нижче початкового мінімуму (новий глобальний мінімум зміщується вправо).
 
     Повертає:
-        pct       (float) — відсоток росту min→max (0.0 якщо min пізніше max)
-        max_price (float) — абсолютна максимальна ціна (high)
-        min_time  (str)   — UTC HH:MM свічки з абсолютним мінімумом
-        max_time  (str)   — UTC HH:MM свічки з абсолютним максимумом
+        pct       (float) — найкращий відсоток росту min→max
+        max_price (float) — ціна максимуму найкращого росту (high)
+        min_time  (str)   — UTC HH:MM свічки з мінімумом (точка відліку)
+        max_time  (str)   — UTC HH:MM свічки з максимумом
     """
     try:
-        abs_min       = float("inf")
-        abs_min_ts    = None
-        abs_max       = 0.0
-        abs_max_ts    = None
+        best_pct    = 0.0
+        best_max    = 0.0
+        best_min_ts = None
+        best_max_ts = None
 
-        # Крок 1+2: знаходимо абсолютний мінімум і максимум за всі свічки
+        running_min    = float("inf")
+        running_min_ts = None
+
         for candle in candles:
             high = float(candle[2] or 0)
             low  = float(candle[3] or 0)
             ts   = int(candle[0])
 
-            if 0 < low < abs_min:
-                abs_min    = low
-                abs_min_ts = ts
+            # Оновлюємо поточний мінімум (ліва точка відліку)
+            if 0 < low < running_min:
+                running_min    = low
+                running_min_ts = ts
 
-            if high > abs_max:
-                abs_max    = high
-                abs_max_ts = ts
+            # Рахуємо ріст від running_min до high поточної свічки
+            # Максимум повинен бути ПІЗНІШЕ мінімуму (суворо >)
+            if (running_min > 0 and high > 0
+                    and running_min_ts is not None
+                    and ts > running_min_ts):
+                pct = (high - running_min) / running_min * 100
+                if pct > best_pct:
+                    best_pct    = pct
+                    best_max    = high
+                    best_min_ts = running_min_ts
+                    best_max_ts = ts
 
-        if abs_min == float("inf") or abs_max <= 0:
+        if best_pct <= 0 or best_min_ts is None or best_max_ts is None:
             return 0.0, 0.0, "--:--", "--:--"
 
-        # Крок 3: мінімум повинен бути РАНІШЕ максимуму
-        if abs_min_ts >= abs_max_ts:
-            return 0.0, 0.0, "--:--", "--:--"
-
-        # Крок 4: рахуємо відсоток росту
-        pct = (abs_max - abs_min) / abs_min * 100
-
-        return pct, abs_max, ts_to_utc(abs_min_ts), ts_to_utc(abs_max_ts)
+        return best_pct, best_max, ts_to_utc(best_min_ts), ts_to_utc(best_max_ts)
 
     except (ValueError, TypeError, IndexError, ZeroDivisionError) as e:
         print(f"Виняток analyze_price_up: {e}")
@@ -301,55 +308,62 @@ def analyze_price_up(candles):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 7: АНАЛІЗ ЦІНИ — ПАДІННЯ MAX→MIN ЗА 8 ГОДИН
-# Крок 1: знаходимо абсолютний максимум (high) за всі 32 свічки
-# Крок 2: знаходимо абсолютний мінімум (low) за всі 32 свічки
-# Крок 3: перевіряємо що максимум хронологічно РАНІШЕ мінімуму
-# Крок 4: рахуємо падіння (max - min) / max × 100
-# Якщо максимум пізніше мінімуму — умова падіння не виконується (повертає 0)
+# Алгоритм одного проходу з running_max зліва направо.
+# На кожній свічці: оновлюємо running_max, рахуємо падіння від running_max до low.
+# Зберігаємо найкращий результат. Гарантія: максимум ЗАВЖДИ раніше мінімуму.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_price_down(candles):
     """
-    Розраховує падіння від абсолютного максимуму до абсолютного мінімуму.
-    Умова: максимум ОБОВ'ЯЗКОВО хронологічно раніше мінімуму.
+    Знаходить найкраще падіння де максимум хронологічно РАНІШЕ мінімуму.
+    Алгоритм одного проходу зліва направо з running_max:
+      — running_max оновлюється на кожній свічці
+      — для кожної свічки рахуємо падіння від running_max до low цієї свічки
+      — зберігаємо найкращий результат (максимальний відсоток)
+    Це дозволяє знайти падіння навіть якщо перед мінімумом ціна зросла
+    вище початкового максимуму (новий глобальний максимум зміщується вправо).
 
     Повертає:
-        pct       (float) — відсоток падіння max→min (0.0 якщо max пізніше min)
-        min_price (float) — абсолютна мінімальна ціна (low)
-        max_time  (str)   — UTC HH:MM свічки з абсолютним максимумом
-        min_time  (str)   — UTC HH:MM свічки з абсолютним мінімумом
+        pct       (float) — найкращий відсоток падіння max→min
+        min_price (float) — ціна мінімуму найкращого падіння (low)
+        max_time  (str)   — UTC HH:MM свічки з максимумом (точка відліку)
+        min_time  (str)   — UTC HH:MM свічки з мінімумом
     """
     try:
-        abs_max    = 0.0
-        abs_max_ts = None
-        abs_min    = float("inf")
-        abs_min_ts = None
+        best_pct    = 0.0
+        best_min    = 0.0
+        best_max_ts = None
+        best_min_ts = None
 
-        # Крок 1+2: знаходимо абсолютний максимум і мінімум за всі свічки
+        running_max    = 0.0
+        running_max_ts = None
+
         for candle in candles:
             high = float(candle[2] or 0)
             low  = float(candle[3] or 0)
             ts   = int(candle[0])
 
-            if high > abs_max:
-                abs_max    = high
-                abs_max_ts = ts
+            # Оновлюємо поточний максимум (ліва точка відліку)
+            if high > running_max:
+                running_max    = high
+                running_max_ts = ts
 
-            if 0 < low < abs_min:
-                abs_min    = low
-                abs_min_ts = ts
+            # Рахуємо падіння від running_max до low поточної свічки
+            # Мінімум повинен бути ПІЗНІШЕ максимуму (суворо >)
+            if (running_max > 0 and low > 0
+                    and running_max_ts is not None
+                    and ts > running_max_ts):
+                pct = (running_max - low) / running_max * 100
+                if pct > best_pct:
+                    best_pct    = pct
+                    best_min    = low
+                    best_max_ts = running_max_ts
+                    best_min_ts = ts
 
-        if abs_max <= 0 or abs_min == float("inf"):
+        if best_pct <= 0 or best_max_ts is None or best_min_ts is None:
             return 0.0, 0.0, "--:--", "--:--"
 
-        # Крок 3: максимум повинен бути РАНІШЕ мінімуму
-        if abs_max_ts >= abs_min_ts:
-            return 0.0, 0.0, "--:--", "--:--"
-
-        # Крок 4: рахуємо відсоток падіння
-        pct = (abs_max - abs_min) / abs_max * 100
-
-        return pct, abs_min, ts_to_utc(abs_max_ts), ts_to_utc(abs_min_ts)
+        return best_pct, best_min, ts_to_utc(best_max_ts), ts_to_utc(best_min_ts)
 
     except (ValueError, TypeError, IndexError, ZeroDivisionError) as e:
         print(f"Виняток analyze_price_down: {e}")

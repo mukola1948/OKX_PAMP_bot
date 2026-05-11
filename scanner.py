@@ -397,11 +397,13 @@ def format_line_block1(inst_id, growth_pct, max_price, min_time, max_time,
     """Формує рядок сигналу для блоку 1 (памп з аномальним об'ємом)"""
     name      = inst_id.replace("-USDT-SWAP", "")
     price_str = fmt_price(max_price)
+    # Формуємо посилання на графік OKX: instId у нижньому регістрі
+    url       = f"https://www.okx.com/ru/trade-swap/{inst_id.lower()}#workspaceId=1"
     base      = f"{name}+{growth_pct:.1f}%;max{price_str}({min_time}-{max_time});V+10х"
     if signal_is_last:
-        return base
+        return f"{base}\n{url}"
     else:
-        return f"{base}({tail_count}св)"
+        return f"{base}({tail_count}св)\n{url}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -416,10 +418,12 @@ def format_line_block2(inst_id, pct, price, start_time, end_time, is_up):
     """Формує рядок сигналу для блоку 2 (рух ціни без перевірки об'ємів)"""
     name      = inst_id.replace("-USDT-SWAP", "")
     price_str = fmt_price(price)
+    # Формуємо посилання на графік OKX: instId у нижньому регістрі
+    url       = f"https://www.okx.com/ru/trade-swap/{inst_id.lower()}#workspaceId=1"
     if is_up:
-        return f"{name}+{pct:.1f}%;max{price_str};{start_time}-{end_time}"
+        return f"{name}+{pct:.1f}%;max{price_str};{start_time}-{end_time}\n{url}"
     else:
-        return f"{name}-{pct:.1f}%;min{price_str};{start_time}-{end_time}"
+        return f"{name}-{pct:.1f}%;min{price_str};{start_time}-{end_time}\n{url}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

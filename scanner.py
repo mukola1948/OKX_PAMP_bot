@@ -19,9 +19,21 @@
 #   Формат ріст:    LAB+53.7%;ОКХ;max0.16021;01:15-05:45
 #   Формат падіння: LAB-53.7%;БІН;min0.16021;01:15-05:45
 #
+# ЛОГІКА ЧЕРГИ ПОВІДОМЛЕНЬ:
+#   — якщо сигналів немає: рядок часу додається до черги у state.json,
+#     нічого не надсилається у Telegram
+#   — якщо знайдено сигнал: надсилається вся черга + поточні сигнали,
+#     черга очищується
+#   Приклад повідомлення після 3 запусків без сигналу і 4-го з сигналом:
+#     2026-06-04 UTC=15:44
+#     2026-06-04 UTC=18:01
+#     2026-06-04 UTC=20:24
+#     OPN+54.1%;ОКХ;max0.31860;17:00-20:45
+#
 # Збереження: state.json зберігає середні об'єми з префіксом біржі:
 #   "OKX:LAYER-USDT-SWAP": 12345.6
 #   "BIN:LAYERUSDT":        12345.6
+#   "pending":              ["2026-06-04 UTC=15:44", ...]
 # =============================================================================
 
 import requests
@@ -59,11 +71,14 @@ LABEL_BIN = "БІН"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 1: ЗБЕРЕЖЕННЯ ТА ЗАВАНТАЖЕННЯ СТАНУ МІЖ ЗАПУСКАМИ
-# state.json: { "OKX:LAYER-USDT-SWAP": 12345.6, "BIN:LAYERUSDT": 12345.6, ... }
+# state.json:
+#   "OKX:LAYER-USDT-SWAP": 12345.6   — ковзне середнє об'єму
+#   "BIN:LAYERUSDT":        12345.6   — ковзне середнє об'єму
+#   "pending":              [...]     — черга рядків часу без сигналів
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_state():
-    """Завантажує збережені середні об'єми з попереднього запуску"""
+    """Завантажує збережені середні об'єми і чергу з попереднього запуску"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
@@ -75,7 +90,7 @@ def load_state():
 
 
 def save_state(state):
-    """Зберігає оновлені середні об'єми для наступного запуску"""
+    """Зберігає оновлені середні об'єми і чергу для наступного запуску"""
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
@@ -129,7 +144,6 @@ def okx_get_candles(inst_id):
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК 3: BINANCE — ОТРИМАННЯ СПИСКУ ІНСТРУМЕНТІВ І СВІЧОК
 # API: https://fapi.binance.com (USD-M Futures, публічний без ключів)
-# Символ Binance: LAYER-USDT-SWAP → LAYERUSDT (прибираємо дефіси і -SWAP)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bin_get_instruments():
@@ -140,11 +154,10 @@ def bin_get_instruments():
         data = resp.json()
         result = []
         for sym in data.get("symbols", []):
-            # Беремо лише активні лінійні безстрокові контракти з USDT
             if (sym.get("status") == "TRADING"
                     and sym.get("contractType") == "PERPETUAL"
                     and sym.get("quoteAsset") == "USDT"):
-                result.append(sym["symbol"])   # наприклад "LAYERUSDT"
+                result.append(sym["symbol"])
         return result
     except (requests.RequestException, ValueError, KeyError) as e:
         print(f"Виняток bin_get_instruments: {e}")
@@ -155,8 +168,7 @@ def bin_get_candles(symbol):
     """
     Повертає 32 свічки 15м для Binance від найстарішої [0] до найновішої [31].
     Binance вже повертає від старих до нових — розвертати не потрібно.
-    Формат свічки: [ts_мс, open, high, low, close, vol, ...]
-    Індекси збігаються з OKX: [0]=ts, [2]=high, [3]=low, [4]=close, [5]=vol
+    Індекси: [0]=ts, [2]=high, [3]=low, [4]=close, [5]=vol — збігається з OKX
     """
     url    = f"{BIN_BASE_URL}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": CANDLE_BAR_BIN, "limit": CANDLES_COUNT}
@@ -165,7 +177,7 @@ def bin_get_candles(symbol):
         data = resp.json()
         if not isinstance(data, list) or len(data) == 0:
             return []
-        return data   # вже від старих до нових
+        return data
     except (requests.RequestException, ValueError) as e:
         print(f"Виняток bin_get_candles {symbol}: {e}")
         return []
@@ -451,10 +463,10 @@ def analyze_instrument(candles, state_key, state, label,
         candles       — список 32 свічок від [0]=найстаріша до [31]=найновіша
         state_key     — ключ для state.json (наприклад "OKX:LAYER-USDT-SWAP")
         state         — словник збережених середніх об'ємів
-        label         — мітка біржі у повідомленні ("ОКХ" або "БІН")
+        label         — мітка біржі ("ОКХ" або "БІН")
         name          — скорочена назва монети (наприклад "LAYER")
-        signals_b1    — список сигналів блоку 1 (памп з об'ємами)
-        signals_b2    — список сигналів блоку 2 (рух без об'ємів)
+        signals_b1    — список сигналів блоку 1
+        signals_b2    — список сигналів блоку 2
         found_b1_keys — множина ключів що вже є в блоці 1
     """
     if len(candles) < 4:
@@ -496,9 +508,8 @@ def analyze_instrument(candles, state_key, state, label,
                 "signal_is_last": signal_is_last,
             })
             found_b1_keys.add(state_key)
-            return   # не дублюємо в блок 2
+            return
     else:
-        # Оновлюємо середнє навіть якщо ріст не досяг порогу
         saved_avg = state.get(state_key, None)
         _, _, _, final_avg = analyze_volumes(candles, saved_avg)
         state[state_key] = final_avg
@@ -513,7 +524,6 @@ def analyze_instrument(candles, state_key, state, label,
     if not best_up and not best_dn:
         return
 
-    # Якщо обидві умови — додаємо ОБИДВА рядки незалежно
     if best_up:
         print(f"  [B2+/{label}] {name}: UP {up_pct:.1f}% | {up_min_time}-{up_max_time}")
         signals_b2.append({
@@ -543,12 +553,13 @@ def analyze_instrument(candles, state_key, state, label,
 # БЛОК 12: ГОЛОВНА ЛОГІКА — ОРКЕСТРАЦІЯ ВСІХ БЛОКІВ
 #
 # Порядок роботи:
-#   1. Завантажуємо state.json
+#   1. Завантажуємо state.json (середні об'єми + черга рядків часу)
 #   2. OKX: отримуємо список інструментів → аналізуємо кожен
 #   3. Binance: отримуємо список інструментів → аналізуємо кожен
-#   4. Об'єднуємо сигнали обох бірж, сортуємо за відсотком
-#   5. Зберігаємо state.json
-#   6. Надсилаємо одне повідомлення у Telegram
+#   4. Зберігаємо state.json
+#   5. ЛОГІКА ЧЕРГИ:
+#      — немає сигналів → додаємо рядок часу до черги, не надсилаємо
+#      — є сигнали → надсилаємо чергу + сигнали, очищуємо чергу
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -557,10 +568,10 @@ def main():
     print(f"=== OKX_PAMP_bot старт | {now_str} ===")
 
     state = load_state()
-    print(f"Завантажено середніх з state.json: {len(state)}")
+    print(f"Завантажено записів з state.json: {len(state)}")
 
-    signals_b1   = []
-    signals_b2   = []
+    signals_b1    = []
+    signals_b2    = []
     found_b1_keys = set()
 
     # ── OKX ──────────────────────────────────────────────────────────────────
@@ -585,54 +596,65 @@ def main():
         candles   = bin_get_candles(symbol)
         time.sleep(REQUEST_DELAY)
         state_key = f"BIN:{symbol}"
-        # Назва монети: LAYERUSDT → LAYER
         name      = symbol.replace("USDT", "")
         analyze_instrument(
             candles, state_key, state, LABEL_BIN,
             name, signals_b1, signals_b2, found_b1_keys
         )
 
-    # ── Зберігаємо state.json ─────────────────────────────────────────────────
-    save_state(state)
-    print(f"state.json збережено ({len(state)} записів)")
+    # ── Формуємо сигнальні рядки ──────────────────────────────────────────────
+    signal_lines = []
 
-    # ── Формуємо повідомлення ─────────────────────────────────────────────────
-    has_b1 = len(signals_b1) > 0
-    has_b2 = len(signals_b2) > 0
+    if signals_b1:
+        signals_b1.sort(key=lambda x: x["growth_pct"], reverse=True)
+        for s in signals_b1:
+            line = format_line_block1(
+                s["name"], s["label"], s["growth_pct"], s["max_price"],
+                s["min_time"], s["max_time"],
+                s["tail_count"], s["signal_is_last"],
+            )
+            signal_lines.append(line)
+            print(f"  >> [B1] {line}")
 
-    if not has_b1 and not has_b2:
-        msg = now_str
-        print("Сигналів не знайдено")
+    if signals_b1 and signals_b2:
+        signal_lines.append("")
+
+    if signals_b2:
+        signals_b2.sort(key=lambda x: x["pct"], reverse=True)
+        for s in signals_b2:
+            line = format_line_block2(
+                s["name"], s["label"], s["pct"], s["price"],
+                s["start_time"], s["end_time"], s["is_up"],
+            )
+            signal_lines.append(line)
+            print(f"  >> [B2] {line}")
+
+    # ── ЛОГІКА ЧЕРГИ ПОВІДОМЛЕНЬ ──────────────────────────────────────────────
+    # Завантажуємо чергу збережених рядків часу з попередніх запусків
+    # (ключ "pending" у state.json, значення — список рядків)
+    pending = state.get("pending", [])
+
+    if not signal_lines:
+        # Сигналів немає:
+        # — додаємо рядок поточного часу до черги
+        # — зберігаємо state.json з оновленою чергою
+        # — нічого не надсилаємо у Telegram
+        pending.append(now_str)
+        state["pending"] = pending
+        save_state(state)
+        print(f"Сигналів немає → рядок часу у чергу ({len(pending)} накопичено)")
     else:
-        lines = []
+        # Знайдено сигнали:
+        # — формуємо повідомлення: спочатку вся черга рядків часу, потім сигнали
+        # — очищуємо чергу у state.json
+        # — зберігаємо state.json і надсилаємо повідомлення
+        all_lines = pending + signal_lines
+        msg = "\n".join(all_lines)
+        state["pending"] = []
+        save_state(state)
+        send_telegram(msg)
+        print(f"Надіслано: {len(pending)} рядків черги + {len(signal_lines)} сигналів")
 
-        if has_b1:
-            signals_b1.sort(key=lambda x: x["growth_pct"], reverse=True)
-            for s in signals_b1:
-                line = format_line_block1(
-                    s["name"], s["label"], s["growth_pct"], s["max_price"],
-                    s["min_time"], s["max_time"],
-                    s["tail_count"], s["signal_is_last"],
-                )
-                lines.append(line)
-                print(f"  >> [B1] {line}")
-
-        if has_b1 and has_b2:
-            lines.append("")
-
-        if has_b2:
-            signals_b2.sort(key=lambda x: x["pct"], reverse=True)
-            for s in signals_b2:
-                line = format_line_block2(
-                    s["name"], s["label"], s["pct"], s["price"],
-                    s["start_time"], s["end_time"], s["is_up"],
-                )
-                lines.append(line)
-                print(f"  >> [B2] {line}")
-
-        msg = "\n".join(lines)
-
-    send_telegram(msg)
     print("=== Завершено ===")
 
 

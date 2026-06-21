@@ -56,7 +56,7 @@ STATE_FILE       = "state.json"
 
 CANDLE_BAR_OKX   = "15m"                       # таймфрейм для OKX
 CANDLE_BAR_BIN   = "15m"                       # таймфрейм для Binance
-CANDLES_COUNT    = 32                           # 32 свічки × 15хв = 8 годин
+CANDLES_COUNT    = 48                           # 48 свічок × 15хв = 12 годин
 MAX_PRICE_USDT   = 5.0                          # максимально допустима ціна монети
 GROWTH_THRESHOLD = 50.0                         # мінімальний ріст/падіння у відсотках
 VOLUME_SPIKE_X   = 10.0                         # кратність аномального об'єму

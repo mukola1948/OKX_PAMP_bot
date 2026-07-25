@@ -98,13 +98,29 @@ def okx_get_instruments(inst_type):
         if data.get("code") != "0":
             print(f"OKX {inst_type} instruments помилка: {data.get('msg')}")
             return []
-        if inst_type == "SWAP":
-            return [i["instId"] for i in data.get("data", [])
-                    if i.get("instId", "").endswith("-USDT-SWAP")]
-        else:
-            # SPOT: беремо лише пари з USDT як квотою
-            return [i["instId"] for i in data.get("data", [])
-                    if i.get("instId", "").endswith("-USDT")]
+        now_ms = int(__import__("time").time() * 1000)
+        result = []
+        for i in data.get("data", []):
+            inst_id = i.get("instId", "")
+            # Фільтр 1: лише активні інструменти (state="live")
+            if i.get("state") != "live":
+                continue
+            # Фільтр 2: якщо є expTime і він у майбутньому — делістинг заплановано
+            # Виключаємо якщо до делістингу менше 7 днів
+            exp_time = i.get("expTime", "")
+            if exp_time:
+                try:
+                    exp_ms = int(exp_time)
+                    days_left = (exp_ms - now_ms) / (1000 * 86400)
+                    if days_left < 7:
+                        continue  # делістинг менш ніж за 7 днів
+                except (ValueError, TypeError):
+                    pass
+            if inst_type == "SWAP" and inst_id.endswith("-USDT-SWAP"):
+                result.append(inst_id)
+            elif inst_type == "SPOT" and inst_id.endswith("-USDT"):
+                result.append(inst_id)
+        return result
     except (requests.RequestException, ValueError, KeyError) as e:
         print(f"Виняток okx_get_instruments({inst_type}): {e}")
         return []
@@ -148,9 +164,22 @@ def mexc_fut_get_instruments():
         if not data.get("success"):
             print(f"MEXC futures instruments помилка: {data}")
             return []
-        result = [item["symbol"] for item in data.get("data", [])
-                  if (item.get("state") == 0 and item.get("futureType") == 1
-                      and item.get("quoteCoin") == "USDT")]
+        now_s = int(__import__("time").time())
+        result = []
+        for item in data.get("data", []):
+            if not (item.get("state") == 0 and item.get("futureType") == 1
+                    and item.get("quoteCoin") == "USDT"):
+                continue
+            # Фільтр: якщо deliveryTime заданий і менше 7 днів — делістинг
+            delivery = item.get("deliveryTime") or item.get("settleTime") or 0
+            if delivery:
+                try:
+                    days_left = (int(delivery) - now_s) / 86400
+                    if days_left < 7:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            result.append(item["symbol"])
         print(f"MEXC ф'ючерси: {len(result)}")
         return result
     except (requests.RequestException, ValueError, KeyError) as e:
@@ -342,8 +371,11 @@ def gate_spot_get_instruments():
             return []
         for item in data:
             # trade_status="tradable" означає активна пара
+            # buy_disabled або sell_disabled = true → пара в процесі делістингу
             if (item.get("trade_status") == "tradable"
-                    and item.get("quote") == "USDT"):
+                    and item.get("quote") == "USDT"
+                    and not item.get("buy_disabled", False)
+                    and not item.get("sell_disabled", False)):
                 result.append(item["id"])  # наприклад "BTC_USDT"
         print(f"Gate спот: {len(result)}")
         return result

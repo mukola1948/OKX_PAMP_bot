@@ -9,7 +9,7 @@
 #   Gate Ф'ючерси:         /api/v4/futures/usdt/contracts, свічки /api/v4/futures/usdt/candlesticks
 #   Gate Спот:             /api/v4/spot/currency_pairs,    свічки /api/v4/spot/candlesticks
 #
-# БЛОК 1: памп з об'ємами  — ціна < 5 USDT, ріст >= 50%, об'єм >= 10х
+# БЛОК 1: памп з об'ємами  — ціна < 5 USDT, ріст >= 50%, об'єм >= 10х (12 год)
 #   Формат ф'ючерс: LAB+63.2%;OKX;max7.7735(17:00-18:45);V+10х(6св)
 #   Формат спот:    Спот.LAB+63.2%;OKX;max7.7735(17:00-18:45);V+10х(6св)
 #
@@ -37,12 +37,12 @@ MEXC_BASE_URL = "https://api.mexc.com"
 GATE_BASE_URL = "https://api.gateio.ws"
 
 STATE_FILE       = "state.json"
-CANDLES_COUNT    = 32                  # 32 × 15хв = 8 годин
+CANDLES_COUNT    = 48                  # 48 × 15хв = 12 годин
 MAX_PRICE_USDT   = 5.0
 GROWTH_THRESHOLD = 50.0
 VOLUME_SPIKE_X   = 10.0
 VOLUME_TAIL_X    = 5.0
-HALF_CANDLES     = CANDLES_COUNT // 2  # = 16
+HALF_CANDLES     = CANDLES_COUNT // 2  # = 24
 MAX_WORKERS      = 10                  # паралельних потоків
 RETRY_DELAY      = 2.0                 # пауза при HTTP 429
 
@@ -561,6 +561,14 @@ def analyze_instrument(candles, state_key, state, label, name,
     except (ValueError, TypeError, IndexError):
         return
     if price <= 0 or price >= MAX_PRICE_USDT: return
+
+    # Перевірка активності пари: якщо об'єм останніх 3 свічок = 0 — пара не торгується
+    try:
+        recent_vols = [float(candles[-(i+1)][5] or 0) for i in range(3)]
+        if all(v == 0 for v in recent_vols):
+            return  # мертва пара — пропускаємо
+    except (IndexError, ValueError, TypeError):
+        pass
 
     stats["passed_price"] += 1
 

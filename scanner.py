@@ -349,8 +349,10 @@ def gate_spot_get_instruments():
 
 def gate_spot_get_candles(currency_pair):
     """
-    Gate спот: {"t","o","h","l","c","v"(base),"sum"(USDT)}
-    vol_usdt[6] = "sum" = quote volume USDT (якщо немає — v × c)
+    Gate спот API повертає свічки у двох форматах залежно від пари:
+      Формат А (dict): {"t":ts_sec,"o":open,"h":high,"l":low,"c":close,"v":vol,"sum":usdt_vol}
+      Формат Б (list): [ts_sec, close, vol, close, high, low, sum] або [ts_sec,o,h,l,c,v,sum]
+    Обробляємо обидва формати. vol_usdt[6] = USDT об'єм.
     """
     for _ in range(2):
         try:
@@ -368,19 +370,34 @@ def gate_spot_get_candles(currency_pair):
             candles = []
             for item in data:
                 try:
-                    vol      = float(item.get("v", 0) or 0)
-                    close    = float(item.get("c", 0) or 0)
-                    vol_usdt = float(item.get("sum", 0) or 0)
-                    if vol_usdt == 0:
-                        vol_usdt = vol * close
-                    candles.append([
-                        int(item["t"]) * 1000,
-                        str(item.get("o", 0)), str(item.get("h", 0)),
-                        str(item.get("l", 0)), str(item.get("c", 0)),
-                        str(vol),
-                        str(vol_usdt),   # USDT об'єм [6]
-                    ])
-                except (KeyError, TypeError, ValueError):
+                    if isinstance(item, dict):
+                        # Формат А: словник {"t","o","h","l","c","v","sum"}
+                        ts       = int(item["t"]) * 1000
+                        o        = str(item.get("o", 0))
+                        h        = str(item.get("h", 0))
+                        l        = str(item.get("l", 0))
+                        c        = str(item.get("c", 0))
+                        vol      = float(item.get("v", 0) or 0)
+                        vol_usdt = float(item.get("sum", 0) or 0)
+                        if vol_usdt == 0:
+                            vol_usdt = vol * float(item.get("c", 0) or 0)
+                    elif isinstance(item, list) and len(item) >= 6:
+                        # Формат Б: масив [ts_sec, o, h, l, c, vol, sum?]
+                        # Gate документація: [time, close, volume, close, high, low]
+                        # або [time, open, high, low, close, volume, amount]
+                        ts       = int(item[0]) * 1000
+                        # Визначаємо формат масиву по типу елементів
+                        # Намагаємось взяти стандартний OHLCV порядок
+                        o        = str(item[1])
+                        h        = str(item[2])
+                        l        = str(item[3])
+                        c        = str(item[4])
+                        vol      = float(item[5] or 0)
+                        vol_usdt = float(item[6] or 0) if len(item) > 6 else vol * float(item[4] or 0)
+                    else:
+                        continue
+                    candles.append([ts, o, h, l, c, str(vol), str(vol_usdt)])
+                except (KeyError, TypeError, ValueError, IndexError):
                     continue
             return candles
         except (requests.RequestException, ValueError):

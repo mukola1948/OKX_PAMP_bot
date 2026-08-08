@@ -1,33 +1,21 @@
 # =============================================================================
 # scanner.py  |  OKX_PAMP_bot  |  OKX + MEXC + Gate.io  |  Спот + Ф'ючерси
 #
-# РИНКИ:
-#   OKX  Ф'ючерси (SWAP):  instType=SWAP,  свічки /api/v5/market/candles
-#   OKX  Спот:             instType=SPOT,  свічки /api/v5/market/candles
-#   MEXC Ф'ючерси:         /api/v1/contract/detail, свічки /api/v1/contract/kline
-#   MEXC Спот:             /api/v3/exchangeInfo,    свічки /api/v3/klines (Binance-формат)
-#   Gate Ф'ючерси:         /api/v4/futures/usdt/contracts, свічки /api/v4/futures/usdt/candlesticks
-#   Gate Спот:             /api/v4/spot/currency_pairs,    свічки /api/v4/spot/candlesticks
+# УНІФІКОВАНИЙ ФОРМАТ СВІЧКИ: [ts_мс, open, high[2], low[3], close[4], vol[5], vol_usdt[6]]
+#   [6] = об'єм у USDT — для фільтру мінімального обороту
 #
-# БЛОК 1: памп з об'ємами  — ціна < 5 USDT, ріст >= 50%, об'єм >= 10х (12 год)
-#   Формат ф'ючерс: LAB+63.2%;OKX;max7.7735(17:00-18:45);V+10х(6св)
-#   Формат спот:    Спот.LAB+63.2%;OKX;max7.7735(17:00-18:45);V+10х(6св)
-#
-# БЛОК 2: рух без об'ємів — ціна < 5 USDT, ріст >= 50% АБО падіння >= 50%
-#   Формат ф'ючерс: LAB+53.7%;MEXC;max0.16021;01:15-05:45
-#   Формат спот:    Спот.LAB-53.7%;GATE;min0.16021;01:15-05:45
-#
-# ЧЕРГА: без сигналу — рядок часу у чергу; з сигналом — надсилаємо все
-# ШВИДКІСТЬ: ThreadPoolExecutor(max_workers=10) — паралельні запити свічок
+# ФІЛЬТРИ (по порядку у analyze_instrument):
+#   1. Мінімум 4 свічки
+#   2. Ціна > 0 і < 5 USDT
+#   3. Об'єм останніх 3 свічок != 0 (не мертва пара)
+#   4. Сума vol_usdt[6] >= 150,000 USDT за 12 год
+#   5. Ріст або падіння >= 50%
+#   6. Для блоку 1: аномальний об'єм >= 10х
 # =============================================================================
 
 import requests, json, os, time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК НАЛАШТУВАНЬ
-# ─────────────────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -36,27 +24,23 @@ OKX_BASE_URL  = "https://www.okx.com"
 MEXC_BASE_URL = "https://api.mexc.com"
 GATE_BASE_URL = "https://api.gateio.ws"
 
-STATE_FILE       = "state.json"
-CANDLES_COUNT    = 48                  # 48 × 15хв = 12 годин
-MAX_PRICE_USDT   = 5.0
-GROWTH_THRESHOLD = 50.0
-VOLUME_SPIKE_X   = 10.0
-VOLUME_TAIL_X    = 5.0
-HALF_CANDLES     = CANDLES_COUNT // 2  # = 24
-MAX_WORKERS      = 10                  # паралельних потоків
-RETRY_DELAY      = 2.0                 # пауза при HTTP 429
+STATE_FILE        = "state.json"
+CANDLES_COUNT     = 48
+MAX_PRICE_USDT    = 5.0
+GROWTH_THRESHOLD  = 50.0
+VOLUME_SPIKE_X    = 10.0
+VOLUME_TAIL_X     = 5.0
+HALF_CANDLES      = CANDLES_COUNT // 2
+MAX_WORKERS       = 10
+RETRY_DELAY       = 2.0
+MIN_VOL_USDT_12H  = 150_000.0   # мінімальний USDT-оборот за 12 год
 
-LABEL_OKX  = "OKX"
-LABEL_MEXC = "MEXC"
-LABEL_GATE = "GATE"
-
-# Префікс у повідомленні для спот-ринку
+LABEL_OKX   = "OKX"
+LABEL_MEXC  = "MEXC"
+LABEL_GATE  = "GATE"
 SPOT_PREFIX = "Спот."
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 1: state.json — атомарне збереження
-# ─────────────────────────────────────────────────────────────────────────────
+# ── state.json ────────────────────────────────────────────────────────────────
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -72,7 +56,6 @@ def load_state():
     return {}
 
 def save_state(state):
-    """Атомарне збереження через .tmp → os.replace"""
     tmp = STATE_FILE + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -81,39 +64,27 @@ def save_state(state):
     except (OSError, TypeError, ValueError) as e:
         print(f"Помилка збереження state.json: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 2: OKX — ф'ючерси і спот
-# Однаковий endpoint свічок для обох ринків: /api/v5/market/candles
-# instType=SWAP → пари BTC-USDT-SWAP
-# instType=SPOT → пари BTC-USDT
-# ─────────────────────────────────────────────────────────────────────────────
+# ── OKX ───────────────────────────────────────────────────────────────────────
 
 def okx_get_instruments(inst_type):
-    """inst_type: 'SWAP' або 'SPOT'. Повертає список instId."""
     try:
         resp = requests.get(f"{OKX_BASE_URL}/api/v5/public/instruments",
                             params={"instType": inst_type}, timeout=15)
         data = resp.json()
         if data.get("code") != "0":
-            print(f"OKX {inst_type} instruments помилка: {data.get('msg')}")
+            print(f"OKX {inst_type} помилка: {data.get('msg')}")
             return []
-        now_ms = int(__import__("time").time() * 1000)
+        now_ms = int(time.time() * 1000)
         result = []
         for i in data.get("data", []):
             inst_id = i.get("instId", "")
-            # Фільтр 1: лише активні інструменти (state="live")
             if i.get("state") != "live":
                 continue
-            # Фільтр 2: якщо є expTime і він у майбутньому — делістинг заплановано
-            # Виключаємо якщо до делістингу менше 7 днів
-            exp_time = i.get("expTime", "")
-            if exp_time:
+            exp = i.get("expTime", "")
+            if exp:
                 try:
-                    exp_ms = int(exp_time)
-                    days_left = (exp_ms - now_ms) / (1000 * 86400)
-                    if days_left < 7:
-                        continue  # делістинг менш ніж за 7 днів
+                    if (int(exp) - now_ms) / (1000 * 86400) < 7:
+                        continue
                 except (ValueError, TypeError):
                     pass
             if inst_type == "SWAP" and inst_id.endswith("-USDT-SWAP"):
@@ -122,14 +93,14 @@ def okx_get_instruments(inst_type):
                 result.append(inst_id)
         return result
     except (requests.RequestException, ValueError, KeyError) as e:
-        print(f"Виняток okx_get_instruments({inst_type}): {e}")
+        print(f"Виняток okx_get_instruments: {e}")
         return []
 
 def okx_get_candles(inst_id):
     """
-    Свічки OKX — однаковий endpoint для SWAP і SPOT.
-    Повертає 32 свічки від [0]=найстаріша до [31]=найновіша.
-    Формат: [ts_мс, open, high[2], low[3], close[4], vol[5]]
+    OKX: [ts, open, high, low, close, vol, volCcy, volCcyQuote(USDT), confirm]
+    Уніфікована: [ts, open, high[2], low[3], close[4], vol[5], vol_usdt[6]]
+    vol_usdt[6] = volCcyQuote (індекс 7 у сирій свічці) = USDT об'єм
     """
     for _ in range(2):
         try:
@@ -141,41 +112,43 @@ def okx_get_candles(inst_id):
             data = resp.json()
             if data.get("code") != "0" or not data.get("data"):
                 return []
-            candles = data["data"]
-            candles.reverse()
+            raw = data["data"]
+            raw.reverse()
+            candles = []
+            for c in raw:
+                try:
+                    candles.append([
+                        c[0], c[1], c[2], c[3], c[4], c[5],
+                        c[7] if len(c) > 7 else "0",  # volCcyQuote = USDT
+                    ])
+                except (IndexError, TypeError):
+                    continue
             return candles
         except (requests.RequestException, ValueError, KeyError):
             return []
     return []
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 3: MEXC — ф'ючерси
-# Символ: "BTC_USDT", час у секундах → × 1000
-# ─────────────────────────────────────────────────────────────────────────────
+# ── MEXC Ф'ЮЧЕРСИ ─────────────────────────────────────────────────────────────
 
 def mexc_fut_get_instruments():
     try:
         resp = requests.get(f"{MEXC_BASE_URL}/api/v1/contract/detail", timeout=15)
         if resp.status_code != 200:
-            print(f"MEXC futures instruments HTTP {resp.status_code}")
+            print(f"MEXC futures HTTP {resp.status_code}")
             return []
         data = resp.json()
         if not data.get("success"):
-            print(f"MEXC futures instruments помилка: {data}")
             return []
-        now_s = int(__import__("time").time())
+        now_s = int(time.time())
         result = []
         for item in data.get("data", []):
             if not (item.get("state") == 0 and item.get("futureType") == 1
                     and item.get("quoteCoin") == "USDT"):
                 continue
-            # Фільтр: якщо deliveryTime заданий і менше 7 днів — делістинг
             delivery = item.get("deliveryTime") or item.get("settleTime") or 0
             if delivery:
                 try:
-                    days_left = (int(delivery) - now_s) / 86400
-                    if days_left < 7:
+                    if (int(delivery) - now_s) / 86400 < 7:
                         continue
                 except (ValueError, TypeError):
                     pass
@@ -188,8 +161,8 @@ def mexc_fut_get_instruments():
 
 def mexc_fut_get_candles(symbol):
     """
-    MEXC ф'ючерси — окремі масиви time[], high[], low[], close[], vol[]
-    Час у секундах → × 1000. Уніфікований формат: [ts_мс, open, high, low, close, vol]
+    MEXC ф'ючерси: масиви time, open, high, low, close, vol, amount(USDT)
+    vol_usdt[6] = amount = USDT об'єм
     """
     for _ in range(2):
         try:
@@ -204,12 +177,13 @@ def mexc_fut_get_candles(symbol):
             if not data.get("success") or not data.get("data"):
                 return []
             d = data["data"]
-            times  = d.get("time",  [])
-            opens  = d.get("open",  [])
-            highs  = d.get("high",  [])
-            lows   = d.get("low",   [])
-            closes = d.get("close", [])
-            vols   = d.get("vol",   [])
+            times   = d.get("time",   [])
+            opens   = d.get("open",   [])
+            highs   = d.get("high",   [])
+            lows    = d.get("low",    [])
+            closes  = d.get("close",  [])
+            vols    = d.get("vol",    [])
+            amounts = d.get("amount", [])
             if not times:
                 return []
             candles = []
@@ -217,11 +191,12 @@ def mexc_fut_get_candles(symbol):
                 try:
                     candles.append([
                         int(times[i]) * 1000,
-                        str(opens[i]  if i < len(opens)  else 0),
-                        str(highs[i]  if i < len(highs)  else 0),
-                        str(lows[i]   if i < len(lows)   else 0),
-                        str(closes[i] if i < len(closes) else 0),
-                        str(vols[i]   if i < len(vols)   else 0),
+                        str(opens[i]   if i < len(opens)   else 0),
+                        str(highs[i]   if i < len(highs)   else 0),
+                        str(lows[i]    if i < len(lows)    else 0),
+                        str(closes[i]  if i < len(closes)  else 0),
+                        str(vols[i]    if i < len(vols)    else 0),
+                        str(amounts[i] if i < len(amounts) else 0),  # USDT [6]
                     ])
                 except (IndexError, TypeError, ValueError):
                     continue
@@ -230,27 +205,20 @@ def mexc_fut_get_candles(symbol):
             return []
     return []
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 4: MEXC — спот
-# Символ: "BTCUSDT" (без підкреслення)
-# Свічки: Binance-формат [ts_мс, open, high, low, close, vol] — вже уніфікований
-# ─────────────────────────────────────────────────────────────────────────────
+# ── MEXC СПОТ ─────────────────────────────────────────────────────────────────
 
 def mexc_spot_get_instruments():
-    """Повертає список символів активних USDT-спот пар на MEXC"""
     try:
         resp = requests.get(f"{MEXC_BASE_URL}/api/v3/exchangeInfo", timeout=20)
         if resp.status_code != 200:
-            print(f"MEXC spot instruments HTTP {resp.status_code}")
+            print(f"MEXC spot HTTP {resp.status_code}")
             return []
         data = resp.json()
-        result = []
-        for sym in data.get("symbols", []):
-            if (sym.get("status") == "ENABLED"
-                    and sym.get("quoteAsset") == "USDT"
-                    and sym.get("isSpotTradingAllowed", False)):
-                result.append(sym["symbol"])  # наприклад "BTCUSDT"
+        result = [
+            s["symbol"] for s in data.get("symbols", [])
+            if (s.get("status") == "ENABLED" and s.get("quoteAsset") == "USDT"
+                and s.get("isSpotTradingAllowed", False))
+        ]
         print(f"MEXC спот: {len(result)}")
         return result
     except (requests.RequestException, ValueError, KeyError) as e:
@@ -259,9 +227,8 @@ def mexc_spot_get_instruments():
 
 def mexc_spot_get_candles(symbol):
     """
-    MEXC спот — Binance-сумісний формат.
-    Повертає 32 свічки від [0]=найстаріша до [31]=найновіша.
-    Формат: [ts_мс, open, high[2], low[3], close[4], vol[5], ...]
+    MEXC спот Binance-формат: [ts,o,h,l,c,vol_base,close_ts,quote_vol_USDT,...]
+    vol_usdt[6] = елемент [7] = quote asset volume (USDT)
     """
     for _ in range(2):
         try:
@@ -276,17 +243,21 @@ def mexc_spot_get_candles(symbol):
             data = resp.json()
             if not isinstance(data, list) or len(data) == 0:
                 return []
-            # Binance формат: [ts_мс, open, high, low, close, vol, ...]
-            # вже від старих до нових, індекси збігаються з OKX
-            return data
+            candles = []
+            for c in data:
+                try:
+                    candles.append([
+                        c[0], c[1], c[2], c[3], c[4], c[5],
+                        str(c[7]) if len(c) > 7 else "0",  # quote vol USDT [6]
+                    ])
+                except (IndexError, TypeError):
+                    continue
+            return candles
         except (requests.RequestException, ValueError):
             return []
     return []
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 5: Gate.io — ф'ючерси
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Gate Ф'ЮЧЕРСИ ─────────────────────────────────────────────────────────────
 
 def gate_fut_get_instruments():
     try:
@@ -297,7 +268,7 @@ def gate_fut_get_instruments():
                 f"{GATE_BASE_URL}/api/v4/futures/usdt/contracts",
                 params={"limit": 100, "offset": offset}, timeout=15)
             if resp.status_code != 200:
-                print(f"Gate futures instruments HTTP {resp.status_code}")
+                print(f"Gate futures HTTP {resp.status_code}")
                 break
             data = resp.json()
             if not isinstance(data, list) or len(data) == 0:
@@ -316,8 +287,8 @@ def gate_fut_get_instruments():
 
 def gate_fut_get_candles(contract):
     """
-    Gate ф'ючерси — {"t": unix_sec, "o", "h", "l", "c", "v"}
-    Уніфікований формат: [ts_мс, open, high, low, close, vol]
+    Gate ф'ючерси: {"t","o","h","l","c","v"(контракти)}
+    vol_usdt[6] = v × c (контракти × ціна закриття ≈ USDT об'єм)
     """
     for _ in range(2):
         try:
@@ -335,11 +306,14 @@ def gate_fut_get_candles(contract):
             candles = []
             for item in data:
                 try:
+                    vol   = float(item.get("v", 0) or 0)
+                    close = float(item.get("c", 0) or 0)
                     candles.append([
                         int(item["t"]) * 1000,
                         str(item.get("o", 0)), str(item.get("h", 0)),
                         str(item.get("l", 0)), str(item.get("c", 0)),
-                        str(item.get("v", 0)),
+                        str(vol),
+                        str(vol * close),   # USDT об'єм [6]
                     ])
                 except (KeyError, TypeError, ValueError):
                     continue
@@ -348,35 +322,25 @@ def gate_fut_get_candles(contract):
             return []
     return []
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 6: Gate.io — спот
-# Символ: "BTC_USDT", свічки {"t": unix_sec, "h", "l", "c", "v"}
-# Той самий формат що й у ф'ючерсах → та сама функція конвертації
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Gate СПОТ ─────────────────────────────────────────────────────────────────
 
 def gate_spot_get_instruments():
-    """Повертає список торгових пар активного USDT-спот ринку Gate.io"""
     try:
-        result = []
-        # Gate spot не потребує пагінації — повертає всі одним запитом
         resp = requests.get(
-            f"{GATE_BASE_URL}/api/v4/spot/currency_pairs",
-            timeout=15)
+            f"{GATE_BASE_URL}/api/v4/spot/currency_pairs", timeout=15)
         if resp.status_code != 200:
-            print(f"Gate spot instruments HTTP {resp.status_code}")
+            print(f"Gate spot HTTP {resp.status_code}")
             return []
         data = resp.json()
         if not isinstance(data, list):
             return []
-        for item in data:
-            # trade_status="tradable" означає активна пара
-            # buy_disabled або sell_disabled = true → пара в процесі делістингу
+        result = [
+            item["id"] for item in data
             if (item.get("trade_status") == "tradable"
-                    and item.get("quote") == "USDT"
-                    and not item.get("buy_disabled", False)
-                    and not item.get("sell_disabled", False)):
-                result.append(item["id"])  # наприклад "BTC_USDT"
+                and item.get("quote") == "USDT"
+                and not item.get("buy_disabled", False)
+                and not item.get("sell_disabled", False))
+        ]
         print(f"Gate спот: {len(result)}")
         return result
     except (requests.RequestException, ValueError, KeyError) as e:
@@ -385,8 +349,8 @@ def gate_spot_get_instruments():
 
 def gate_spot_get_candles(currency_pair):
     """
-    Gate спот — {"t": unix_sec, "h", "l", "c", "v"} — той самий формат що й ф'ючерси.
-    Уніфікований формат: [ts_мс, open, high, low, close, vol]
+    Gate спот: {"t","o","h","l","c","v"(base),"sum"(USDT)}
+    vol_usdt[6] = "sum" = quote volume USDT (якщо немає — v × c)
     """
     for _ in range(2):
         try:
@@ -404,11 +368,17 @@ def gate_spot_get_candles(currency_pair):
             candles = []
             for item in data:
                 try:
+                    vol      = float(item.get("v", 0) or 0)
+                    close    = float(item.get("c", 0) or 0)
+                    vol_usdt = float(item.get("sum", 0) or 0)
+                    if vol_usdt == 0:
+                        vol_usdt = vol * close
                     candles.append([
                         int(item["t"]) * 1000,
                         str(item.get("o", 0)), str(item.get("h", 0)),
                         str(item.get("l", 0)), str(item.get("c", 0)),
-                        str(item.get("v", 0)),
+                        str(vol),
+                        str(vol_usdt),   # USDT об'єм [6]
                     ])
                 except (KeyError, TypeError, ValueError):
                     continue
@@ -417,10 +387,7 @@ def gate_spot_get_candles(currency_pair):
             return []
     return []
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 7: Допоміжні функції
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Допоміжні функції ─────────────────────────────────────────────────────────
 
 def ts_to_utc(ts_ms):
     try:
@@ -435,10 +402,7 @@ def fmt_price(p):
     if p >= 0.01:  return f"{p:.5f}"
     return f"{p:.7f}"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 8: Аналіз об'ємів — ковзне середнє з виключенням аномалій
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Аналіз об'ємів ────────────────────────────────────────────────────────────
 
 def analyze_volumes(candles, saved_avg):
     if not candles:
@@ -477,11 +441,7 @@ def analyze_volumes(candles, saved_avg):
     final_avg = sum(volumes_in_base)/len(volumes_in_base) if volumes_in_base else current_avg
     return signal_found, signal_idx, tail_count, final_avg
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 9: Аналіз ціни — ріст і падіння
-# running_min/running_max — екстремуми завжди хронологічно впорядковані
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Аналіз ціни ───────────────────────────────────────────────────────────────
 
 def analyze_price_up(candles):
     try:
@@ -521,11 +481,7 @@ def analyze_price_down(candles):
         print(f"Виняток analyze_price_down: {e}")
         return 0.0, 0.0, "--:--", "--:--"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 10: Форматування рядків сигналів
-# is_spot=True → додаємо префікс "Спот." перед назвою монети
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Форматування ──────────────────────────────────────────────────────────────
 
 def fmt_b1(name, label, growth_pct, max_price, min_time, max_time,
            tail_count, is_last, is_spot):
@@ -542,10 +498,7 @@ def fmt_b2(name, label, pct, price, start_time, end_time, is_up, is_spot):
     else:
         return f"{prefix}{name}-{pct:.1f}%;{label};min{p};{start_time}-{end_time}"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 11: Telegram
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -559,13 +512,9 @@ def send_telegram(text):
     except (requests.RequestException, OSError) as e:
         print(f"Виняток send_telegram: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 12: Паралельне завантаження свічок
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Паралельне завантаження ───────────────────────────────────────────────────
 
 def fetch_all_candles(instruments, fetch_fn):
-    """Паралельно завантажує свічки. Повертає список (ident, candles)."""
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ident = {executor.submit(fetch_fn, ident): ident
@@ -579,28 +528,35 @@ def fetch_all_candles(instruments, fetch_fn):
             results.append((ident, candles))
     return results
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 13: Аналіз одного інструменту
-# is_spot — передається з main(), визначає префікс у повідомленні
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Аналіз одного інструменту ─────────────────────────────────────────────────
 
 def analyze_instrument(candles, state_key, state, label, name,
                        signals_b1, signals_b2, found_b1_keys, stats, is_spot):
+    # Фільтр 1: мінімум свічок
     if len(candles) < 4: return
+
+    # Фільтр 2: ціна 0 < price < 5 USDT
     try:
         price = float(candles[-1][4] or 0)
     except (ValueError, TypeError, IndexError):
         return
     if price <= 0 or price >= MAX_PRICE_USDT: return
 
-    # Перевірка активності пари: якщо об'єм останніх 3 свічок = 0 — пара не торгується
+    # Фільтр 3: мертва пара (нульові об'єми останніх 3 свічок)
     try:
-        recent_vols = [float(candles[-(i+1)][5] or 0) for i in range(3)]
-        if all(v == 0 for v in recent_vols):
-            return  # мертва пара — пропускаємо
+        if all(float(candles[-(i+1)][5] or 0) == 0 for i in range(3)):
+            return
     except (IndexError, ValueError, TypeError):
         pass
+
+    # Фільтр 4: мінімальний USDT-об'єм за 12 год >= 150,000 USDT
+    # vol_usdt знаходиться у індексі [6] уніфікованої свічки
+    try:
+        total_vol_usdt = sum(float(c[6] or 0) for c in candles if len(c) > 6)
+        if total_vol_usdt < MIN_VOL_USDT_12H:
+            return
+    except (ValueError, TypeError):
+        return
 
     stats["passed_price"] += 1
 
@@ -610,16 +566,17 @@ def analyze_instrument(candles, state_key, state, label, name,
     if up_pct >= GROWTH_THRESHOLD or dn_pct >= GROWTH_THRESHOLD:
         stats["passed_growth"] += 1
 
-    # ── Блок 1 ──
+    # ── Блок 1: памп з аномальним об'ємом ──
     if up_pct >= GROWTH_THRESHOLD:
         saved_avg = state.get(state_key)
         sig_found, sig_idx, tail, final_avg = analyze_volumes(candles, saved_avg)
         state[state_key] = final_avg
         if sig_found:
             is_last = (sig_idx == len(candles) - 1)
-            prefix = "Спот." if is_spot else ""
+            prefix = SPOT_PREFIX if is_spot else ""
             print(f"  [B1/{label}] {prefix}{name}: +{up_pct:.1f}% | "
-                  f"{up_min_t}-{up_max_t} | хвіст={tail}св")
+                  f"{up_min_t}-{up_max_t} | хвіст={tail}св | "
+                  f"vol={total_vol_usdt:,.0f}$")
             signals_b1.append({
                 "name": name, "label": label, "growth_pct": up_pct,
                 "max_price": up_price, "min_time": up_min_t, "max_time": up_max_t,
@@ -632,29 +589,27 @@ def analyze_instrument(candles, state_key, state, label, name,
         _, _, _, final_avg = analyze_volumes(candles, saved_avg)
         state[state_key] = final_avg
 
-    # ── Блок 2 ──
+    # ── Блок 2: рух без перевірки аномальних об'ємів ──
     if state_key in found_b1_keys: return
     best_up = up_pct >= GROWTH_THRESHOLD
     best_dn = dn_pct >= GROWTH_THRESHOLD
     if not best_up and not best_dn: return
 
-    prefix = "Спот." if is_spot else ""
+    prefix = SPOT_PREFIX if is_spot else ""
     if best_up:
-        print(f"  [B2+/{label}] {prefix}{name}: UP {up_pct:.1f}% | {up_min_t}-{up_max_t}")
+        print(f"  [B2+/{label}] {prefix}{name}: UP {up_pct:.1f}% | "
+              f"vol={total_vol_usdt:,.0f}$")
         signals_b2.append({"name": name, "label": label, "pct": up_pct,
             "price": up_price, "start_time": up_min_t, "end_time": up_max_t,
             "is_up": True, "is_spot": is_spot})
     if best_dn:
-        print(f"  [B2-/{label}] {prefix}{name}: DN {dn_pct:.1f}% | {dn_max_t}-{dn_min_t}")
+        print(f"  [B2-/{label}] {prefix}{name}: DN {dn_pct:.1f}% | "
+              f"vol={total_vol_usdt:,.0f}$")
         signals_b2.append({"name": name, "label": label, "pct": dn_pct,
             "price": dn_price, "start_time": dn_max_t, "end_time": dn_min_t,
             "is_up": False, "is_spot": is_spot})
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# БЛОК 14: Головна логіка
-# Порядок: OKX SWAP → OKX SPOT → MEXC FUT → MEXC SPOT → GATE FUT → GATE SPOT
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Головна логіка ────────────────────────────────────────────────────────────
 
 def main():
     now_utc = datetime.now(timezone.utc)
@@ -668,80 +623,60 @@ def main():
     stats = {"passed_price": 0, "passed_growth": 0}
     t0 = time.time()
 
-    # ── Допоміжна функція обробки одного ринку ──────────────────────────────
-    def process_market(instruments, fetch_fn, label, name_fn,
-                       key_prefix, is_spot):
+    def process_market(instruments, fetch_fn, label, name_fn, key_prefix, is_spot):
         results = fetch_all_candles(instruments, fetch_fn)
         for ident, candles in results:
-            name = name_fn(ident)
-            state_key = f"{key_prefix}:{ident}"
-            analyze_instrument(candles, state_key, state, label, name,
-                               signals_b1, signals_b2, found_b1_keys,
-                               stats, is_spot)
+            analyze_instrument(candles, f"{key_prefix}:{ident}", state,
+                               label, name_fn(ident),
+                               signals_b1, signals_b2, found_b1_keys, stats, is_spot)
 
-    # ── OKX SWAP (ф'ючерси) ──────────────────────────────────────────────────
     okx_swap = okx_get_instruments("SWAP")
     print(f"OKX SWAP: {len(okx_swap)}")
     process_market(okx_swap, okx_get_candles, LABEL_OKX,
-                   lambda x: x.replace("-USDT-SWAP", ""),
-                   "OKX_SW", is_spot=False)
+                   lambda x: x.replace("-USDT-SWAP", ""), "OKX_SW", is_spot=False)
 
-    # ── OKX SPOT ─────────────────────────────────────────────────────────────
     okx_spot = okx_get_instruments("SPOT")
     print(f"OKX SPOT: {len(okx_spot)}")
     process_market(okx_spot, okx_get_candles, LABEL_OKX,
-                   lambda x: x.replace("-USDT", ""),
-                   "OKX_SP", is_spot=True)
+                   lambda x: x.replace("-USDT", ""), "OKX_SP", is_spot=True)
 
-    # ── MEXC Ф'ЮЧЕРСИ ────────────────────────────────────────────────────────
     mexc_fut = mexc_fut_get_instruments()
     process_market(mexc_fut, mexc_fut_get_candles, LABEL_MEXC,
-                   lambda x: x.replace("_USDT", ""),
-                   "MEX_FW", is_spot=False)
+                   lambda x: x.replace("_USDT", ""), "MEX_FW", is_spot=False)
 
-    # ── MEXC СПОТ ────────────────────────────────────────────────────────────
     mexc_spt = mexc_spot_get_instruments()
     process_market(mexc_spt, mexc_spot_get_candles, LABEL_MEXC,
-                   lambda x: x.replace("USDT", ""),
-                   "MEX_SP", is_spot=True)
+                   lambda x: x.replace("USDT", ""), "MEX_SP", is_spot=True)
 
-    # ── Gate Ф'ЮЧЕРСИ ────────────────────────────────────────────────────────
     gate_fut = gate_fut_get_instruments()
     process_market(gate_fut, gate_fut_get_candles, LABEL_GATE,
-                   lambda x: x.replace("_USDT", ""),
-                   "GAT_FW", is_spot=False)
+                   lambda x: x.replace("_USDT", ""), "GAT_FW", is_spot=False)
 
-    # ── Gate СПОТ ────────────────────────────────────────────────────────────
     gate_spt = gate_spot_get_instruments()
     process_market(gate_spt, gate_spot_get_candles, LABEL_GATE,
-                   lambda x: x.replace("_USDT", ""),
-                   "GAT_SP", is_spot=True)
+                   lambda x: x.replace("_USDT", ""), "GAT_SP", is_spot=True)
 
-    print(f"Діагностика: пройшли ціну (<{MAX_PRICE_USDT}$): {stats['passed_price']} | "
-          f"пройшли рух (>={GROWTH_THRESHOLD}%): {stats['passed_growth']}")
+    print(f"Діагностика: пройшли ціну+об'єм({MIN_VOL_USDT_12H/1000:.0f}k$): "
+          f"{stats['passed_price']} | пройшли рух: {stats['passed_growth']}")
 
-    # ── Формуємо сигнальні рядки ──────────────────────────────────────────────
     signal_lines = []
     if signals_b1:
         signals_b1.sort(key=lambda x: x["growth_pct"], reverse=True)
         for s in signals_b1:
-            line = fmt_b1(s["name"], s["label"], s["growth_pct"], s["max_price"],
-                          s["min_time"], s["max_time"],
-                          s["tail_count"], s["signal_is_last"], s["is_spot"])
-            signal_lines.append(line)
-            print(f"  >> [B1] {line}")
+            signal_lines.append(fmt_b1(
+                s["name"], s["label"], s["growth_pct"], s["max_price"],
+                s["min_time"], s["max_time"],
+                s["tail_count"], s["signal_is_last"], s["is_spot"]))
     if signals_b1 and signals_b2:
         signal_lines.append("")
     if signals_b2:
         signals_b2.sort(key=lambda x: x["pct"], reverse=True)
         for s in signals_b2:
-            line = fmt_b2(s["name"], s["label"], s["pct"], s["price"],
-                          s["start_time"], s["end_time"],
-                          s["is_up"], s["is_spot"])
-            signal_lines.append(line)
-            print(f"  >> [B2] {line}")
+            signal_lines.append(fmt_b2(
+                s["name"], s["label"], s["pct"], s["price"],
+                s["start_time"], s["end_time"],
+                s["is_up"], s["is_spot"]))
 
-    # ── Логіка черги ──────────────────────────────────────────────────────────
     pending = state.get("pending", [])
     if not signal_lines:
         pending.append(now_str)
@@ -753,7 +688,7 @@ def main():
         state["pending"] = []
         save_state(state)
         send_telegram(msg)
-        print(f"Надіслано: {len(pending)} рядків черги + {len(signal_lines)} сигналів")
+        print(f"Надіслано: {len(pending)} черги + {len(signal_lines)} сигналів")
 
     print(f"=== Завершено за {time.time()-t0:.1f}с ===")
 

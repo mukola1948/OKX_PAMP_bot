@@ -11,6 +11,23 @@
 #   4. Сума vol_usdt[6] >= 150,000 USDT за 12 год
 #   5. Ріст або падіння >= 50%
 #   6. Для блоку 1: аномальний об'єм >= 10х
+#
+# ЗМІНИ 10.08.2026 (узгоджено з ViTar, відповіді №1-15):
+#   1. Повідомлення в Telegram тепер ГРУПУЮТЬСЯ по біржах і типу ринку в
+#      порядку: OKX ф'ючерси → OKX спот → MEXC ф'ючерси → MEXC спот →
+#      Gate спот → Gate ф'ючерси (функція market_priority()).
+#   2. Доданий Gate-тригер: якщо символ Блоку 2 (рух ціни ≥50% UP) є на
+#      ф'ючерсах Gate.io — сканер надсилає подію repository_dispatch у
+#      приватний репозиторій OKX_PA3OM_3_bot, де "четвертий суб-бот"
+#      (Gate-бот) відкриває позицію. Тригер НЕ надсилається, якщо:
+#        а) серед 48 аналізованих свічок є хоч ОДНА свічка з діапазоном
+#           (найвища-найнижча)/найнижча ≥37% (has_sharp_candle());
+#        б) по цьому символу зараз діє "охолодження" — з моменту
+#           попереднього тригера ціна ще не зросла на +60% і не впала
+#           на -30% (gate_cooldown_check()/gate_cooldown_set()).
+#      Охолодження й фільтр різких свічок впливають ЛИШЕ на Gate-тригер,
+#      на сам Telegram-сигнал Блоку 2 вони не впливають (він надсилається
+#      як і раніше).
 # =============================================================================
 
 import requests, json, os, time
@@ -19,6 +36,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ── Gate-тригер: доступ до приватного репозиторію OKX_PA3OM_3_bot ─────────────
+# GATE_DISPATCH_TOKEN — Personal Access Token з правом "repo" саме на
+# приватний репозиторій OKX_PA3OM_3_bot (зберігається як GitHub Secret
+# у ЦЬОМУ, публічному репозиторії OKX_PAMP_bot).
+# GATE_TARGET_OWNER — Ваш логін на GitHub (власник обох репозиторіїв).
+GATE_DISPATCH_TOKEN = os.environ.get("GATE_DISPATCH_TOKEN", "")
+GATE_TARGET_OWNER   = os.environ.get("GATE_TARGET_OWNER", "")
+GATE_TARGET_REPO    = os.environ.get("GATE_TARGET_REPO", "OKX_PA3OM_3_bot")
+GATE_EVENT_TYPE      = "gate_signal"
 
 OKX_BASE_URL  = "https://www.okx.com"
 MEXC_BASE_URL = "https://api.mexc.com"
@@ -34,6 +61,16 @@ HALF_CANDLES      = CANDLES_COUNT // 2
 MAX_WORKERS       = 10
 RETRY_DELAY       = 2.0
 MIN_VOL_USDT_12H  = 150_000.0   # мінімальний USDT-оборот за 12 год
+
+# Поріг "різкої" свічки для виключення Gate-тригера (діапазон
+# high/low відносно low, у %). Узгоджено 10.08.2026 — досить ОДНІЄЇ
+# такої свічки серед 48-ми, щоб Gate-тригер НЕ надсилався.
+SHARP_CANDLE_RANGE_PCT = 37.0
+
+# Пороги зняття охолодження Gate-тригера по символу (у %, від ціни
+# тригера). Знімається тим порогом, який настане РАНІШЕ.
+GATE_COOLDOWN_UP_PCT   = 60.0
+GATE_COOLDOWN_DOWN_PCT = 30.0
 
 LABEL_OKX   = "OKX"
 LABEL_MEXC  = "MEXC"
@@ -419,6 +456,101 @@ def fmt_price(p):
     if p >= 0.01:  return f"{p:.5f}"
     return f"{p:.7f}"
 
+# ── Групування повідомлень по біржах/типу ринку (додано 10.08.2026) ───────────
+
+def market_priority(label, is_spot):
+    """
+    Порядок блоків у Telegram-повідомленні (узгоджено 10.08.2026):
+    OKX ф'ючерси(0) → OKX спот(1) → MEXC ф'ючерси(2) → MEXC спот(3) →
+    Gate спот(4) → Gate ф'ючерси(5) — саме для Gate порядок ф'ючерси/спот
+    навмисно ПЕРЕВЕРНУТО відносно інших бірж, за прямою вказівкою ViTar.
+    """
+    if label == LABEL_OKX:  return 0 if not is_spot else 1
+    if label == LABEL_MEXC: return 2 if not is_spot else 3
+    if label == LABEL_GATE: return 4 if is_spot else 5
+    return 9
+
+# ── Gate-тригер: різкі свічки й охолодження (додано 10.08.2026) ───────────────
+
+def has_sharp_candle(candles):
+    """
+    True якщо серед свічок є хоч ОДНА з діапазоном
+    (найвища-найнижча ціна свічки)/найнижча ціна свічки >= SHARP_CANDLE_RANGE_PCT.
+    Наявність такої свічки ВИКЛЮЧАЄ символ з Gate-тригера (не з Telegram-сигналу).
+    """
+    for c in candles:
+        try:
+            high = float(c[2] or 0); low = float(c[3] or 0)
+            if low > 0 and (high - low) / low * 100 >= SHARP_CANDLE_RANGE_PCT:
+                return True
+        except (ValueError, TypeError, IndexError):
+            continue
+    return False
+
+def gate_cooldown_check(state, base_symbol):
+    """True якщо по base_symbol зараз діє охолодження Gate-тригера."""
+    cooldown = state.get("gate_cooldown", {})
+    return base_symbol in cooldown
+
+def gate_cooldown_update_or_clear(state, base_symbol, current_price):
+    """
+    Якщо по символу є активне охолодження — перевіряє чи не настав час
+    його зняти (ціна зросла на +60% чи впала на -30% від ціни тригера,
+    що настане раніше). Знімає охолодження (видаляє запис), якщо так.
+    Викликається для КОЖНОГО символу під охолодженням на кожному рані,
+    незалежно від того спрацював зараз Блок 1/2 чи ні.
+    """
+    cooldown = state.setdefault("gate_cooldown", {})
+    entry = cooldown.get(base_symbol)
+    if not entry:
+        return
+    trigger_price = entry.get("price", 0.0)
+    if trigger_price <= 0 or current_price <= 0:
+        return
+    change_pct = (current_price - trigger_price) / trigger_price * 100
+    if change_pct >= GATE_COOLDOWN_UP_PCT or change_pct <= -GATE_COOLDOWN_DOWN_PCT:
+        cooldown.pop(base_symbol, None)
+        print(f"  [GATE cooldown] {base_symbol}: знято ({change_pct:+.1f}%)")
+
+def gate_cooldown_set(state, base_symbol, trigger_price):
+    cooldown = state.setdefault("gate_cooldown", {})
+    cooldown[base_symbol] = {
+        "price": trigger_price,
+        "ts":    int(time.time() * 1000),
+    }
+
+def send_gate_dispatch(base_symbol, trigger_price):
+    """
+    Надсилає подію repository_dispatch у приватний репозиторій
+    OKX_PA3OM_3_bot (owner/repo з GATE_TARGET_OWNER/GATE_TARGET_REPO),
+    яка активує там Gate-суб-бота через окремий workflow
+    (run_gate_entry.yml, on: repository_dispatch).
+    """
+    if not GATE_DISPATCH_TOKEN or not GATE_TARGET_OWNER:
+        print("  [GATE dispatch] не налаштовано GATE_DISPATCH_TOKEN/GATE_TARGET_OWNER — пропуск")
+        return
+    url = f"https://api.github.com/repos/{GATE_TARGET_OWNER}/{GATE_TARGET_REPO}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {GATE_DISPATCH_TOKEN}",
+        "Accept":        "application/vnd.github+json",
+    }
+    payload = {
+        "event_type": GATE_EVENT_TYPE,
+        "client_payload": {
+            "symbol":        base_symbol,
+            "gate_contract": f"{base_symbol}_USDT",
+            "price":         trigger_price,
+        },
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code == 204:
+            print(f"  [GATE dispatch] надіслано: {base_symbol} @ {trigger_price}")
+        else:
+            print(f"  [GATE dispatch] помилка {resp.status_code}: {resp.text}")
+    except (requests.RequestException, OSError) as e:
+        print(f"  [GATE dispatch] виняток: {e}")
+
 # ── Аналіз об'ємів ────────────────────────────────────────────────────────────
 
 def analyze_volumes(candles, saved_avg):
@@ -548,7 +680,8 @@ def fetch_all_candles(instruments, fetch_fn):
 # ── Аналіз одного інструменту ─────────────────────────────────────────────────
 
 def analyze_instrument(candles, state_key, state, label, name,
-                       signals_b1, signals_b2, found_b1_keys, stats, is_spot):
+                       signals_b1, signals_b2, found_b1_keys, stats, is_spot,
+                       gate_fut_set):
     # Фільтр 1: мінімум свічок
     if len(candles) < 4: return
 
@@ -576,6 +709,12 @@ def analyze_instrument(candles, state_key, state, label, name,
         return
 
     stats["passed_price"] += 1
+
+    # Охолодження Gate-тригера перевіряємо/знімаємо для КОЖНОГО символу,
+    # що дійшов до сюди (незалежно від того чи буде зараз новий сигнал) —
+    # щоб +60%/-30% відслідковувались щорану, а не лише в момент сигналу.
+    if name in state.get("gate_cooldown", {}):
+        gate_cooldown_update_or_clear(state, name, price)
 
     up_pct, up_price, up_min_t, up_max_t = analyze_price_up(candles)
     dn_pct, dn_price, dn_max_t, dn_min_t = analyze_price_down(candles)
@@ -619,6 +758,15 @@ def analyze_instrument(candles, state_key, state, label, name,
         signals_b2.append({"name": name, "label": label, "pct": up_pct,
             "price": up_price, "start_time": up_min_t, "end_time": up_max_t,
             "is_up": True, "is_spot": is_spot})
+
+        # ── Gate-тригер (лише Блок 2, лише UP, додано 10.08.2026) ──
+        # Кандидат лише якщо: символ є на ф'ючерсах Gate.io, немає жодної
+        # різкої свічки (>=37%) серед 48-ми, і по символу зараз НЕ діє
+        # охолодження.
+        if name in gate_fut_set and not has_sharp_candle(candles) \
+                and not gate_cooldown_check(state, name):
+            gate_cooldown_set(state, name, price)
+            send_gate_dispatch(name, price)
     if best_dn:
         print(f"  [B2-/{label}] {prefix}{name}: DN {dn_pct:.1f}% | "
               f"vol={total_vol_usdt:,.0f}$")
@@ -640,12 +788,20 @@ def main():
     stats = {"passed_price": 0, "passed_growth": 0}
     t0 = time.time()
 
+    # Список ф'ючерсних інструментів Gate.io завантажуємо ПЕРШИМ, ще до
+    # обробки решти бірж — потрібен для перевірки кандидатів на Gate-тригер
+    # (додано 10.08.2026, раніше завантажувався лише при обробці самого
+    # блоку Gate ф'ючерсів, тепер потрібен для ВСІХ бірж одразу).
+    gate_fut_raw = gate_fut_get_instruments()
+    gate_fut_set = {x.replace("_USDT", "") for x in gate_fut_raw}
+
     def process_market(instruments, fetch_fn, label, name_fn, key_prefix, is_spot):
         results = fetch_all_candles(instruments, fetch_fn)
         for ident, candles in results:
             analyze_instrument(candles, f"{key_prefix}:{ident}", state,
                                label, name_fn(ident),
-                               signals_b1, signals_b2, found_b1_keys, stats, is_spot)
+                               signals_b1, signals_b2, found_b1_keys, stats,
+                               is_spot, gate_fut_set)
 
     okx_swap = okx_get_instruments("SWAP")
     print(f"OKX SWAP: {len(okx_swap)}")
@@ -665,8 +821,7 @@ def main():
     process_market(mexc_spt, mexc_spot_get_candles, LABEL_MEXC,
                    lambda x: x.replace("USDT", ""), "MEX_SP", is_spot=True)
 
-    gate_fut = gate_fut_get_instruments()
-    process_market(gate_fut, gate_fut_get_candles, LABEL_GATE,
+    process_market(gate_fut_raw, gate_fut_get_candles, LABEL_GATE,
                    lambda x: x.replace("_USDT", ""), "GAT_FW", is_spot=False)
 
     gate_spt = gate_spot_get_instruments()
@@ -678,7 +833,10 @@ def main():
 
     signal_lines = []
     if signals_b1:
-        signals_b1.sort(key=lambda x: x["growth_pct"], reverse=True)
+        # Групування по біржах/типу ринку (додано 10.08.2026), у межах
+        # групи — за спаданням сили сигналу, як і раніше.
+        signals_b1.sort(key=lambda x: (market_priority(x["label"], x["is_spot"]),
+                                        -x["growth_pct"]))
         for s in signals_b1:
             signal_lines.append(fmt_b1(
                 s["name"], s["label"], s["growth_pct"], s["max_price"],
@@ -687,7 +845,8 @@ def main():
     if signals_b1 and signals_b2:
         signal_lines.append("")
     if signals_b2:
-        signals_b2.sort(key=lambda x: x["pct"], reverse=True)
+        signals_b2.sort(key=lambda x: (market_priority(x["label"], x["is_spot"]),
+                                        -x["pct"]))
         for s in signals_b2:
             signal_lines.append(fmt_b2(
                 s["name"], s["label"], s["pct"], s["price"],

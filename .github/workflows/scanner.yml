@@ -1,6 +1,11 @@
 # =============================================================================
 # .github/workflows/scanner.yml
 # OKX_PAMP_bot — автозапуск кожні 15 хвилин через GitHub Actions
+#
+# ЗМІНА 10.08.2026: додано два секрети (GATE_DISPATCH_TOKEN,
+# GATE_TARGET_OWNER) у Крок 4 — потрібні для відправки
+# repository_dispatch у приватний репозиторій OKX_PA3OM_3_bot при
+# Gate-тригері (функція send_gate_dispatch() у scanner.py).
 # =============================================================================
 
 name: OKX PAMP Scanner
@@ -34,15 +39,17 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      # ── Крок 4: запускаємо сканер з секретами Telegram
+      # ── Крок 4: запускаємо сканер з секретами Telegram + Gate-тригера
       - name: Run scanner
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          GATE_DISPATCH_TOKEN:  ${{ secrets.GATE_DISPATCH_TOKEN }}
+          GATE_TARGET_OWNER:    ${{ secrets.GATE_TARGET_OWNER }}
         run: python scanner.py
 
       # ── Крок 5: зберігаємо оновлений state.json назад у репозиторій
-      # Це дозволяє середні об'єми зберігатися між запусками
+      # Це дозволяє середні об'єми та Gate-охолодження зберігатися між запусками
       - name: Save state to repo
         run: |
           git config user.name  "github-actions[bot]"

@@ -388,7 +388,8 @@ def gate_spot_get_candles(currency_pair):
     """
     Gate спот API повертає свічки у двох форматах залежно від пари:
       Формат А (dict): {"t":ts_sec,"o":open,"h":high,"l":low,"c":close,"v":vol,"sum":usdt_vol}
-      Формат Б (list): [ts_sec, close, vol, close, high, low, sum] або [ts_sec,o,h,l,c,v,sum]
+      Формат Б (list): [timestamp, quote_volume(USDT), close, high, low, open, base_volume]
+                       (порядок ВИПРАВЛЕНО 13.08.2026 — див. коментар нижче)
     Обробляємо обидва формати. vol_usdt[6] = USDT об'єм.
     """
     for _ in range(2):
@@ -419,18 +420,20 @@ def gate_spot_get_candles(currency_pair):
                         if vol_usdt == 0:
                             vol_usdt = vol * float(item.get("c", 0) or 0)
                     elif isinstance(item, list) and len(item) >= 6:
-                        # Формат Б: масив [ts_sec, o, h, l, c, vol, sum?]
-                        # Gate документація: [time, close, volume, close, high, low]
-                        # або [time, open, high, low, close, volume, amount]
+                        # Формат Б (масив) — РЕАЛЬНИЙ порядок полів Gate.io:
+                        # [timestamp, quote_volume(USDT), close, high, low,
+                        #  open, base_volume]. ВИПРАВЛЕНО 13.08.2026 — раніше
+                        # тут помилково стояло [ts,o,h,l,c,vol,sum], через що
+                        # vol_usdt бралось з base_volume (кількість монет),
+                        # а не з реального USDT-обороту — фільтр мінімального
+                        # обороту 150k через це міг пропускати неліквідні пари.
                         ts       = int(item[0]) * 1000
-                        # Визначаємо формат масиву по типу елементів
-                        # Намагаємось взяти стандартний OHLCV порядок
-                        o        = str(item[1])
-                        h        = str(item[2])
-                        l        = str(item[3])
-                        c        = str(item[4])
-                        vol      = float(item[5] or 0)
-                        vol_usdt = float(item[6] or 0) if len(item) > 6 else vol * float(item[4] or 0)
+                        vol_usdt = float(item[1] or 0)
+                        c        = str(item[2])
+                        h        = str(item[3])
+                        l        = str(item[4])
+                        o        = str(item[5])
+                        vol      = float(item[6]) if len(item) > 6 else 0.0
                     else:
                         continue
                     candles.append([ts, o, h, l, c, str(vol), str(vol_usdt)])

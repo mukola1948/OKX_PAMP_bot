@@ -49,11 +49,31 @@ jobs:
         run: python scanner.py
 
       # ── Крок 5: зберігаємо оновлений state.json назад у репозиторій
-      # Це дозволяє середні об'єми та Gate-охолодження зберігатися між запусками
+      # Це дозволяє середні об'єми та Gate-охолодження зберігатися між запусками.
+      #
+      # ВИПРАВЛЕНО 13.08.2026: раніше "git push ... || true" МОВЧКИ
+      # ковтав помилку push — якщо push не проходив, оновлений
+      # state.json (з gate_cooldown) губився, і символи, що мали бути
+      # заблоковані охолодженням, знову тригерили Gate_PICT_bot.
+      # Тепер: pull --rebase перед push (як і в OKX_PA3OM_3_bot) +
+      # до 3 спроб push з паузою, і якщо всі спроби провалились —
+      # workflow явно ЗАВЕРШУЄТЬСЯ З ПОМИЛКОЮ (видно в Actions),
+      # а не мовчки "успішно".
       - name: Save state to repo
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json || true
           git diff --staged --quiet || git commit -m "update state"
-          git push origin main || true
+
+          for i in 1 2 3; do
+            git pull origin main --rebase --strategy-option=theirs
+            if git push origin main; then
+              echo "Push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Push failed on attempt $i, retrying..."
+            sleep 5
+          done
+          echo "::error::Push failed after 3 attempts — state.json NOT saved!"
+          exit 1

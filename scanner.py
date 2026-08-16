@@ -393,8 +393,13 @@ def gate_spot_get_candles(currency_pair):
     """
     Gate спот API повертає свічки у двох форматах залежно від пари:
       Формат А (dict): {"t":ts_sec,"o":open,"h":high,"l":low,"c":close,"v":vol,"sum":usdt_vol}
-      Формат Б (list): [ts_sec, close, vol, close, high, low, sum] або [ts_sec,o,h,l,c,v,sum]
-    Обробляємо обидва формати. vol_usdt[6] = USDT об'єм.
+      Формат Б (list, ВИПРАВЛЕНО 16.08.2026): [ts_sec, quote_volume_usdt,
+        close, high, low, open] — офіційний порядок полів Gate API v4,
+        підтверджений документацією (приклад відповіді біржі:
+        ["1539852480","971519.677","0.0021724","0.0021922","0.0021724","0.0021737"]).
+    Обробляємо обидва формати. vol_usdt[6] у результаті — USDT об'єм
+    (внутрішній уніфікований формат цієї функції, не плутати з
+    позицією quote_volume у сирій відповіді Gate, яка інша — item[1]).
     """
     for _ in range(2):
         try:
@@ -424,18 +429,41 @@ def gate_spot_get_candles(currency_pair):
                         if vol_usdt == 0:
                             vol_usdt = vol * float(item.get("c", 0) or 0)
                     elif isinstance(item, list) and len(item) >= 6:
-                        # Формат Б: масив [ts_sec, o, h, l, c, vol, sum?]
-                        # Gate документація: [time, close, volume, close, high, low]
-                        # або [time, open, high, low, close, volume, amount]
+                        # ВИПРАВЛЕНО 16.08.2026 — КРИТИЧНИЙ БАГ, підтверджено
+                        # офіційною документацією Gate API v4 (реальний приклад
+                        # відповіді біржі):
+                        #   ["1539852480","971519.677","0.0021724",
+                        #    "0.0021922","0.0021724","0.0021737"]
+                        # Справжній порядок: [ts, quote_volume(USDT), close,
+                        # high, low, open].
+                        #
+                        # РАНІШЕ тут стояло НЕВІРНЕ припущення [ts,o,h,l,c,vol],
+                        # яке зсовувало АБСОЛЮТНО ВСІ поля на один крок:
+                        # quote_volume (USDT-обсяг) сприймався як "open",
+                        # close як "high", high як "low", low як "close",
+                        # open як "vol" — тобто і ціни, і обсяг були переплутані
+                        # для КОЖНОЇ Gate спот-свічки, що прийшла у форматі
+                        # масиву (список, не словник). Це напряму спотворювало:
+                        # розрахунок росту ціни (analyze_price_up/down),
+                        # виявлення різкої свічки (has_sharp_candle), і
+                        # фільтр мінімального обсягу (Фільтр 4 нижче) — саме
+                        # це і спричиняло сигнали на кшталт "+87% при нульовому
+                        # реальному обсязі" (виявлено ViTar, тест 小股东/USDT).
                         ts       = int(item[0]) * 1000
-                        # Визначаємо формат масиву по типу елементів
-                        # Намагаємось взяти стандартний OHLCV порядок
-                        o        = str(item[1])
-                        h        = str(item[2])
-                        l        = str(item[3])
-                        c        = str(item[4])
-                        vol      = float(item[5] or 0)
-                        vol_usdt = float(item[6] or 0) if len(item) > 6 else vol * float(item[4] or 0)
+                        vol_usdt = float(item[1] or 0)
+                        c        = str(item[2])
+                        h        = str(item[3])
+                        l        = str(item[4])
+                        o        = str(item[5])
+                        # Обсяг у базовій монеті — окреме 7-ме поле є не
+                        # завжди (в офіційному прикладі його взагалі немає);
+                        # якщо є — використовуємо, інакше рахуємо самі як
+                        # USDT-обсяг/ціну закриття.
+                        if len(item) > 6:
+                            vol = float(item[6] or 0)
+                        else:
+                            close_f = float(c or 0)
+                            vol = (vol_usdt / close_f) if close_f > 0 else 0.0
                     else:
                         continue
                     candles.append([ts, o, h, l, c, str(vol), str(vol_usdt)])

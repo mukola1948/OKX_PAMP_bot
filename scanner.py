@@ -25,9 +25,14 @@
 #        б) по цьому символу зараз діє "охолодження" — з моменту
 #           попереднього тригера ціна ще не зросла на +60% і не впала
 #           на -30% (gate_cooldown_check()/gate_cooldown_set()).
-#      Охолодження й фільтр різких свічок впливають ЛИШЕ на Gate-тригер,
-#      на сам Telegram-сигнал Блоку 2 вони не впливають (він надсилається
-#      як і раніше).
+#
+# ЗМІНИ 12.08.2026 (узгоджено з ViTar):
+#   3. Фільтр різкої свічки (>=37%, has_sharp_candle()) ПОШИРЕНО і на
+#      сам Telegram-сигнал сканера — тепер якщо серед 48 аналізованих
+#      свічок символу є хоч одна різка, символ НЕ з'являється у
+#      Telegram-повідомленні цього рану ані в Блоці 1, ані в Блоці 2
+#      (UP і DN), а не лише виключається з Gate-тригера, як було раніше.
+#      Охолодження (б) лишається виключно логікою Gate-тригера.
 # =============================================================================
 
 import requests, json, os, time
@@ -388,8 +393,7 @@ def gate_spot_get_candles(currency_pair):
     """
     Gate спот API повертає свічки у двох форматах залежно від пари:
       Формат А (dict): {"t":ts_sec,"o":open,"h":high,"l":low,"c":close,"v":vol,"sum":usdt_vol}
-      Формат Б (list): [timestamp, quote_volume(USDT), close, high, low, open, base_volume]
-                       (порядок ВИПРАВЛЕНО 13.08.2026 — див. коментар нижче)
+      Формат Б (list): [ts_sec, close, vol, close, high, low, sum] або [ts_sec,o,h,l,c,v,sum]
     Обробляємо обидва формати. vol_usdt[6] = USDT об'єм.
     """
     for _ in range(2):
@@ -420,20 +424,18 @@ def gate_spot_get_candles(currency_pair):
                         if vol_usdt == 0:
                             vol_usdt = vol * float(item.get("c", 0) or 0)
                     elif isinstance(item, list) and len(item) >= 6:
-                        # Формат Б (масив) — РЕАЛЬНИЙ порядок полів Gate.io:
-                        # [timestamp, quote_volume(USDT), close, high, low,
-                        #  open, base_volume]. ВИПРАВЛЕНО 13.08.2026 — раніше
-                        # тут помилково стояло [ts,o,h,l,c,vol,sum], через що
-                        # vol_usdt бралось з base_volume (кількість монет),
-                        # а не з реального USDT-обороту — фільтр мінімального
-                        # обороту 150k через це міг пропускати неліквідні пари.
+                        # Формат Б: масив [ts_sec, o, h, l, c, vol, sum?]
+                        # Gate документація: [time, close, volume, close, high, low]
+                        # або [time, open, high, low, close, volume, amount]
                         ts       = int(item[0]) * 1000
-                        vol_usdt = float(item[1] or 0)
-                        c        = str(item[2])
-                        h        = str(item[3])
-                        l        = str(item[4])
-                        o        = str(item[5])
-                        vol      = float(item[6]) if len(item) > 6 else 0.0
+                        # Визначаємо формат масиву по типу елементів
+                        # Намагаємось взяти стандартний OHLCV порядок
+                        o        = str(item[1])
+                        h        = str(item[2])
+                        l        = str(item[3])
+                        c        = str(item[4])
+                        vol      = float(item[5] or 0)
+                        vol_usdt = float(item[6] or 0) if len(item) > 6 else vol * float(item[4] or 0)
                     else:
                         continue
                     candles.append([ts, o, h, l, c, str(vol), str(vol_usdt)])
@@ -479,7 +481,13 @@ def has_sharp_candle(candles):
     """
     True якщо серед свічок є хоч ОДНА з діапазоном
     (найвища-найнижча ціна свічки)/найнижча ціна свічки >= SHARP_CANDLE_RANGE_PCT.
-    Наявність такої свічки ВИКЛЮЧАЄ символ з Gate-тригера (не з Telegram-сигналу).
+
+    Наявність такої свічки ВИКЛЮЧАЄ символ:
+    - з Gate-тригера (repository_dispatch у Gate_PICT) — як і раніше;
+    - з Telegram-повідомлення сканера, Блок 1 і Блок 2 (додано
+      12.08.2026, за прямою вказівкою ViTar) — символ повністю не
+      з'являється в жодному з блоків повідомлення цього рану, якщо
+      серед його 48 аналізованих свічок є хоч один різкий стрибок.
     """
     for c in candles:
         try:
@@ -713,6 +721,14 @@ def analyze_instrument(candles, state_key, state, label, name,
 
     stats["passed_price"] += 1
 
+    # Різка свічка (додано 12.08.2026, поширено з Gate-тригера на
+    # ОБИДВА блоки Telegram-сигналів сканера — за прямою вказівкою
+    # ViTar): якщо серед 48 аналізованих свічок є хоч одна з діапазоном
+    # (хай-лой)/лой >= SHARP_CANDLE_RANGE_PCT (37%) — рахуємо один раз
+    # і використовуємо нижче і для Блоку 1, і для Блоку 2, і для
+    # Gate-тригера (замість трьох окремих викликів has_sharp_candle()).
+    sharp = has_sharp_candle(candles)
+
     # Охолодження Gate-тригера перевіряємо/знімаємо для КОЖНОГО символу,
     # що дійшов до сюди (незалежно від того чи буде зараз новий сигнал) —
     # щоб +60%/-30% відслідковувались щорану, а не лише в момент сигналу.
@@ -731,6 +747,14 @@ def analyze_instrument(candles, state_key, state, label, name,
         sig_found, sig_idx, tail, final_avg = analyze_volumes(candles, saved_avg)
         state[state_key] = final_avg
         if sig_found:
+            found_b1_keys.add(state_key)
+            if sharp:
+                # Сигнал знайдено, але символ виключено з Telegram-
+                # повідомлення сканера через різку свічку (>=37%).
+                prefix = SPOT_PREFIX if is_spot else ""
+                print(f"  [B1/{label}] {prefix}{name}: +{up_pct:.1f}% | "
+                      f"ПРОПУЩЕНО (різка свічка >={SHARP_CANDLE_RANGE_PCT:.0f}%)")
+                return
             is_last = (sig_idx == len(candles) - 1)
             prefix = SPOT_PREFIX if is_spot else ""
             print(f"  [B1/{label}] {prefix}{name}: +{up_pct:.1f}% | "
@@ -741,7 +765,6 @@ def analyze_instrument(candles, state_key, state, label, name,
                 "max_price": up_price, "min_time": up_min_t, "max_time": up_max_t,
                 "tail_count": tail, "signal_is_last": is_last, "is_spot": is_spot,
             })
-            found_b1_keys.add(state_key)
             return
     else:
         saved_avg = state.get(state_key)
@@ -756,26 +779,34 @@ def analyze_instrument(candles, state_key, state, label, name,
 
     prefix = SPOT_PREFIX if is_spot else ""
     if best_up:
-        print(f"  [B2+/{label}] {prefix}{name}: UP {up_pct:.1f}% | "
-              f"vol={total_vol_usdt:,.0f}$")
-        signals_b2.append({"name": name, "label": label, "pct": up_pct,
-            "price": up_price, "start_time": up_min_t, "end_time": up_max_t,
-            "is_up": True, "is_spot": is_spot})
+        if sharp:
+            print(f"  [B2+/{label}] {prefix}{name}: UP {up_pct:.1f}% | "
+                  f"ПРОПУЩЕНО (різка свічка >={SHARP_CANDLE_RANGE_PCT:.0f}%)")
+        else:
+            print(f"  [B2+/{label}] {prefix}{name}: UP {up_pct:.1f}% | "
+                  f"vol={total_vol_usdt:,.0f}$")
+            signals_b2.append({"name": name, "label": label, "pct": up_pct,
+                "price": up_price, "start_time": up_min_t, "end_time": up_max_t,
+                "is_up": True, "is_spot": is_spot})
 
         # ── Gate-тригер (лише Блок 2, лише UP, додано 10.08.2026) ──
         # Кандидат лише якщо: символ є на ф'ючерсах Gate.io, немає жодної
-        # різкої свічки (>=37%) серед 48-ми, і по символу зараз НЕ діє
-        # охолодження.
-        if name in gate_fut_set and not has_sharp_candle(candles) \
+        # різкої свічки (>=37%, змінна sharp — рахується один раз вище),
+        # і по символу зараз НЕ діє охолодження.
+        if name in gate_fut_set and not sharp \
                 and not gate_cooldown_check(state, name):
             gate_cooldown_set(state, name, price)
             send_gate_dispatch(name, price)
     if best_dn:
-        print(f"  [B2-/{label}] {prefix}{name}: DN {dn_pct:.1f}% | "
-              f"vol={total_vol_usdt:,.0f}$")
-        signals_b2.append({"name": name, "label": label, "pct": dn_pct,
-            "price": dn_price, "start_time": dn_max_t, "end_time": dn_min_t,
-            "is_up": False, "is_spot": is_spot})
+        if sharp:
+            print(f"  [B2-/{label}] {prefix}{name}: DN {dn_pct:.1f}% | "
+                  f"ПРОПУЩЕНО (різка свічка >={SHARP_CANDLE_RANGE_PCT:.0f}%)")
+        else:
+            print(f"  [B2-/{label}] {prefix}{name}: DN {dn_pct:.1f}% | "
+                  f"vol={total_vol_usdt:,.0f}$")
+            signals_b2.append({"name": name, "label": label, "pct": dn_pct,
+                "price": dn_price, "start_time": dn_max_t, "end_time": dn_min_t,
+                "is_up": False, "is_spot": is_spot})
 
 # ── Головна логіка ────────────────────────────────────────────────────────────
 

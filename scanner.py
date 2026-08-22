@@ -893,27 +893,35 @@ def main():
     print(f"Діагностика: пройшли ціну+об'єм({MIN_VOL_USDT_12H/1000:.0f}k$): "
           f"{stats['passed_price']} | пройшли рух: {stats['passed_growth']}")
 
+    # ВИПРАВЛЕНО 21.08.2026 (за прямою вказівкою ViTar, друга правка):
+    # у межах ОДНІЄЇ групи біржі БІЛЬШЕ НЕМАЄ жодного поділу на
+    # "сильніші"/"слабші" чи "підтверджені"/"непідтверджені" сигнали
+    # (Блок 1 проти Блоку 2) — таке впорядкування Claude додав
+    # самостійно без узгодження, що було помилкою. Єдиний критерій —
+    # група біржі/типу ринку (market_priority). У межах групи —
+    # НЕЙТРАЛЬНИЙ алфавітний порядок за назвою символу, без жодного
+    # судження про важливість чи достовірність сигналу.
+    combined = [("b1", market_priority(s["label"], s["is_spot"]), s) for s in signals_b1]
+    combined += [("b2", market_priority(s["label"], s["is_spot"]), s) for s in signals_b2]
+
+    combined.sort(key=lambda item: (item[1], item[2]["name"]))
+
     signal_lines = []
-    if signals_b1:
-        # Групування по біржах/типу ринку (додано 10.08.2026), у межах
-        # групи — за спаданням сили сигналу, як і раніше.
-        signals_b1.sort(key=lambda x: (market_priority(x["label"], x["is_spot"]),
-                                        -x["growth_pct"]))
-        for s in signals_b1:
+    prev_prio = None
+    for block, prio, s in combined:
+        if prev_prio is not None and prio != prev_prio:
+            signal_lines.append("")
+        if block == "b1":
             signal_lines.append(fmt_b1(
                 s["name"], s["label"], s["growth_pct"], s["max_price"],
                 s["min_time"], s["max_time"],
                 s["tail_count"], s["signal_is_last"], s["is_spot"]))
-    if signals_b1 and signals_b2:
-        signal_lines.append("")
-    if signals_b2:
-        signals_b2.sort(key=lambda x: (market_priority(x["label"], x["is_spot"]),
-                                        -x["pct"]))
-        for s in signals_b2:
+        else:
             signal_lines.append(fmt_b2(
                 s["name"], s["label"], s["pct"], s["price"],
                 s["start_time"], s["end_time"],
                 s["is_up"], s["is_spot"]))
+        prev_prio = prio
 
     pending = state.get("pending", [])
     if not signal_lines:

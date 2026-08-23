@@ -33,6 +33,12 @@
 #      Telegram-повідомленні цього рану ані в Блоці 1, ані в Блоці 2
 #      (UP і DN), а не лише виключається з Gate-тригера, як було раніше.
 #      Охолодження (б) лишається виключно логікою Gate-тригера.
+#
+# ЗМІНИ 21.08.2026 (узгоджено з ViTar):
+#   4. Gate-тригер РОЗШИРЕНО на Блок 1 (памп з підтвердженим
+#      аномальним обсягом) — раніше тригер надсилався ЛИШЕ з Блоку 2
+#      (рух ≥50% без перевірки обсягу). Умови (а)/(б) вище лишаються
+#      тими самими для обох блоків.
 # =============================================================================
 
 import requests, json, os, time
@@ -793,6 +799,17 @@ def analyze_instrument(candles, state_key, state, label, name,
                 "max_price": up_price, "min_time": up_min_t, "max_time": up_max_t,
                 "tail_count": tail, "signal_is_last": is_last, "is_spot": is_spot,
             })
+
+            # ── Gate-тригер (розширено на Блок 1, 21.08.2026, за
+            # прямою вказівкою ViTar) — раніше тригер надсилався
+            # ЛИШЕ з Блоку 2, тепер і Блок 1 (памп з підтвердженим
+            # аномальним обсягом) теж може відкрити угоду Gate_PICT.
+            # Ті самі умови, що й для Блоку 2: символ є на ф'ючерсах
+            # Gate.io, немає різкої свічки, немає охолодження.
+            if name in gate_fut_set and not sharp \
+                    and not gate_cooldown_check(state, name):
+                gate_cooldown_set(state, name, price)
+                send_gate_dispatch(name, price)
             return
     else:
         saved_avg = state.get(state_key)
@@ -817,7 +834,8 @@ def analyze_instrument(candles, state_key, state, label, name,
                 "price": up_price, "start_time": up_min_t, "end_time": up_max_t,
                 "is_up": True, "is_spot": is_spot})
 
-        # ── Gate-тригер (лише Блок 2, лише UP, додано 10.08.2026) ──
+        # ── Gate-тригер (Блок 2, лише UP; з 21.08.2026 — не єдине
+        # місце тригера, дивись також Блок 1 вище) ──
         # Кандидат лише якщо: символ є на ф'ючерсах Gate.io, немає жодної
         # різкої свічки (>=37%, змінна sharp — рахується один раз вище),
         # і по символу зараз НЕ діє охолодження.

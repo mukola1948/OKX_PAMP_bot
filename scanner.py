@@ -499,14 +499,20 @@ def fmt_price(p):
 
 def market_priority(label, is_spot):
     """
-    Порядок блоків у Telegram-повідомленні (узгоджено 10.08.2026):
-    OKX ф'ючерси(0) → OKX спот(1) → MEXC ф'ючерси(2) → MEXC спот(3) →
-    Gate спот(4) → Gate ф'ючерси(5) — саме для Gate порядок ф'ючерси/спот
-    навмисно ПЕРЕВЕРНУТО відносно інших бірж, за прямою вказівкою ViTar.
+    Порядок блоків у Telegram-повідомленні.
+
+    ЗМІНЕНО 21.08.2026 (за прямою вказівкою ViTar): порядок ГРУП БІРЖ
+    повністю ПЕРЕВЕРНУТО відносно того, що було до цього (10.08.2026):
+    Gate ф'ючерси(0) → Gate спот(1) → MEXC спот(2) → MEXC ф'ючерси(3) →
+    OKX спот(4) → OKX ф'ючерси(5) — тобто те, що раніше було внизу
+    повідомлення, тепер зверху, і навпаки. Внутрішній порядок пари
+    ф'ючерси/спот для Gate (ф'ючерси ПЕРЕД спотом, на відміну від
+    OKX/MEXC де спот йде після ф'ючерсів) зберігся автоматично, бо
+    він теж просто перевернувся разом з усім списком.
     """
-    if label == LABEL_OKX:  return 0 if not is_spot else 1
-    if label == LABEL_MEXC: return 2 if not is_spot else 3
-    if label == LABEL_GATE: return 4 if is_spot else 5
+    if label == LABEL_OKX:  return 5 if not is_spot else 4
+    if label == LABEL_MEXC: return 3 if not is_spot else 2
+    if label == LABEL_GATE: return 0 if not is_spot else 1
     return 9
 
 # ── Gate-тригер: різкі свічки й охолодження (додано 10.08.2026) ───────────────
